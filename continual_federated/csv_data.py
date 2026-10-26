@@ -27,26 +27,60 @@ def load_csv_series(path, target=None, limit=None):
 
 
 def make_rounds(values, client_count=2, rounds=2, seq_len=4, pred_len=1,
-                batch_size=32):
+                batch_size=32, return_evaluation=False, standardize=False):
     if len(values) < client_count * (seq_len + pred_len):
         raise ValueError('dataset is too small for the requested clients and windows')
     streams = list(torch.tensor_split(values, client_count))
+    statistics = []
+    for stream in streams:
+        reference_end = max(seq_len + pred_len,
+                            len(stream) // rounds * 4 // 5)
+        reference = stream[:reference_end]
+        statistics.append((reference.mean(), reference.std().clamp_min(1e-6)))
     result = []
+    evaluation = []
     for round_index in range(rounds):
         client_round = []
+        client_test_round = []
         for stream in streams:
             start = 0 if round_index == 0 else round_index * len(stream) // rounds
             end = len(stream) if round_index == rounds - 1 else (round_index + 1) * len(stream) // rounds
             chunk = stream[start:end]
-            batches = []
-            window_count = len(chunk) - seq_len - pred_len + 1
-            for batch_start in range(0, max(0, window_count), batch_size):
-                batch_indices = range(batch_start, min(batch_start + batch_size, window_count))
-                inputs = torch.stack([chunk[index:index + seq_len]
-                                      for index in batch_indices]).unsqueeze(-1)
-                targets = torch.stack([chunk[index + seq_len:index + seq_len + pred_len]
-                                       for index in batch_indices]).unsqueeze(-1)
-                batches.append((inputs, targets))
-            client_round.append(batches)
+            if return_evaluation:
+                required_length = max(
+                    int((seq_len + pred_len) / 0.8 + 1),
+                    int(pred_len / 0.2 + 1))
+                if len(chunk) < required_length:
+                    raise ValueError(
+                        'each round chunk needs at least {} values for train/test windows; got {}'.format(
+                            required_length, len(chunk)))
+            if standardize:
+                mean, std = statistics[len(client_round)]
+                chunk = (chunk - mean) / std
+            split = max(seq_len + pred_len, int(len(chunk) * 0.8))
+            split = min(split, len(chunk))
+
+            def windows(chunk_values, first_target, last_target):
+                batches = []
+                target_count = max(0, last_target - first_target)
+                for batch_start in range(0, target_count, batch_size):
+                    target_indices = range(
+                        first_target + batch_start,
+                        min(first_target + batch_start + batch_size, last_target))
+                    inputs = torch.stack([
+                        chunk_values[index - seq_len:index] for index in target_indices
+                    ]).unsqueeze(-1)
+                    targets = torch.stack([
+                        chunk_values[index:index + pred_len] for index in target_indices
+                    ]).unsqueeze(-1)
+                    batches.append((inputs, targets))
+                return batches
+
+            client_round.append(windows(chunk, seq_len, split - pred_len + 1))
+            test_start = max(seq_len, split)
+            client_test_round.append(windows(chunk, test_start, len(chunk) - pred_len + 1))
         result.append(client_round)
+        evaluation.append(client_test_round)
+    if return_evaluation:
+        return result, evaluation
     return result

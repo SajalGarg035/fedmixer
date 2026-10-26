@@ -12,6 +12,23 @@ class FedMixerServer:
         self.recluster_loss_fraction = recluster_loss_fraction
         self.recluster_similarity = recluster_similarity
         self.clusters = None
+        self.seasonal_clusters = None
+        self.trend_clusters = None
+
+    @staticmethod
+    def generate_synthetic_fourier_probes(seq_len, channels, batch_size=8,
+                                          device=None, frequencies=None):
+        """Create deterministic harmonic and polynomial probes without client data."""
+        device = device or torch.device('cpu')
+        time = torch.linspace(0, 1, seq_len, device=device)
+        frequencies = frequencies or (1, 2, 4)
+        probes = []
+        for index in range(batch_size):
+            frequency = frequencies[index % len(frequencies)]
+            signal = torch.sin(2 * torch.pi * frequency * time)
+            signal = signal + 0.1 * (2 * time - 1) ** 2
+            probes.append(signal.unsqueeze(-1).repeat(1, channels))
+        return torch.stack(probes)
 
     @staticmethod
     def _flatten_state(state):
@@ -45,6 +62,45 @@ class FedMixerServer:
         self.clusters = [[index for index, label in enumerate(labels) if label == cluster]
                          for cluster in range(count)]
         return self.clusters
+
+    def _cluster_signatures(self, signatures):
+        if not signatures:
+            return []
+        if len(signatures) == 1:
+            return [[0]]
+        vectors = torch.stack([signature.float().flatten() for signature in signatures])
+        distances = torch.cdist(vectors, vectors, p=1)
+        nonzero = distances[distances > 0]
+        scale = nonzero.median().clamp_min(1e-8) if nonzero.numel() else torch.tensor(1.0)
+        affinity = torch.exp(-distances / scale).numpy()
+        count = self.cluster_count or min(3, len(signatures))
+        if nonzero.numel() == 0 or nonzero.max() <= scale * 0.1:
+            count = 1
+        count = max(1, min(count, len(signatures)))
+        if count == 1:
+            return [list(range(len(signatures)))]
+        if count == len(signatures):
+            return [[index] for index in range(len(signatures))]
+        labels = SpectralClustering(
+            n_clusters=count, affinity='precomputed', assign_labels='kmeans',
+            random_state=self.random_state).fit_predict(affinity)
+        return [[index for index, label in enumerate(labels) if label == cluster]
+                for cluster in range(count)]
+
+    def cluster_bipartite(self, seasonal_signatures, trend_signatures):
+        self.seasonal_clusters = self._cluster_signatures(seasonal_signatures)
+        self.trend_clusters = self._cluster_signatures(trend_signatures)
+        self.clusters = self.seasonal_clusters
+        return self.seasonal_clusters, self.trend_clusters
+
+    def recluster_pathways(self, seasonal_signatures, trend_signatures,
+                           seasonal=True, trend=True):
+        if seasonal or self.seasonal_clusters is None:
+            self.seasonal_clusters = self._cluster_signatures(seasonal_signatures)
+        if trend or self.trend_clusters is None:
+            self.trend_clusters = self._cluster_signatures(trend_signatures)
+        self.clusters = self.seasonal_clusters
+        return self.seasonal_clusters, self.trend_clusters
 
     def should_recluster(self, states, losses):
         if self.clusters is None or not losses:
@@ -86,6 +142,46 @@ class FedMixerServer:
             self.cluster_clients(states, losses)
         return [self.average_cluster(states, indices, sample_counts)
                 for indices in self.clusters]
+
+    @staticmethod
+    def _pathway(name):
+        if 'mixing_multi_scale_season' in name:
+            return 'season'
+        if ('mixing_multi_scale_trend' in name or 'predict_layers' in name
+                or 'out_cross_layer' in name):
+            return 'trend'
+        return 'base'
+
+    def aggregate_decoupled(self, states, seasonal_signatures, trend_signatures,
+                            sample_counts=None, force_recluster=False):
+        if force_recluster or self.seasonal_clusters is None:
+            self.cluster_bipartite(seasonal_signatures, trend_signatures)
+        global_state = self.average_cluster(
+            states, list(range(len(states))), sample_counts)
+        seasonal_states = {
+            index: self.average_cluster(states, indices, sample_counts)
+            for index, indices in enumerate(self.seasonal_clusters)}
+        trend_states = {
+            index: self.average_cluster(states, indices, sample_counts)
+            for index, indices in enumerate(self.trend_clusters)}
+        seasonal_lookup = {
+            client: cluster for cluster, indices in enumerate(self.seasonal_clusters)
+            for client in indices}
+        trend_lookup = {
+            client: cluster for cluster, indices in enumerate(self.trend_clusters)
+            for client in indices}
+        aggregated = []
+        for client_index in range(len(states)):
+            result = {}
+            for name, value in global_state.items():
+                pathway = self._pathway(name)
+                if pathway == 'season':
+                    value = seasonal_states[seasonal_lookup[client_index]][name]
+                elif pathway == 'trend':
+                    value = trend_states[trend_lookup[client_index]][name]
+                result[name] = value
+            aggregated.append(result)
+        return aggregated
 
     @staticmethod
     @torch.no_grad()

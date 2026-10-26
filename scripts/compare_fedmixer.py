@@ -33,12 +33,18 @@ def build_rounds(data_dir, client_count, rounds, limit):
     for client_index in range(client_count):
         path = Path(data_dir) / 'clients' / 'client_{:03d}.csv'.format(client_index)
         values = load_csv_series(path, target='load', limit=limit)
-        client_batches.append(make_rounds(values, 1, rounds, 96, 96, batch_size=32))
-    return [[client_batches[index][round_index]
-             for index in range(client_count)] for round_index in range(rounds)]
+        train_rounds, test_rounds = make_rounds(
+            values, 1, rounds, 96, 96, batch_size=32,
+            return_evaluation=True, standardize=True)
+        client_batches.append((train_rounds, test_rounds))
+    train_batches = [[client_batches[index][0][round_index]
+                      for index in range(client_count)] for round_index in range(rounds)]
+    test_batches = [[client_batches[index][1][round_index]
+                     for index in range(client_count)] for round_index in range(rounds)]
+    return train_batches, test_batches
 
 
-def run_variant(round_batches, device, continual, seed):
+def run_variant(round_batches, test_rounds, device, continual, seed):
     torch.manual_seed(seed)
     clients = []
     for _ in round_batches[0]:
@@ -51,21 +57,34 @@ def run_variant(round_batches, device, continual, seed):
     def forward(model, inputs):
         return model(inputs, None, None, None)
 
-    first_client_round = round_batches[0][0][0]
-    public_inputs = first_client_round[0].to(device)
-    trainer = ContinualFedMixer(clients, forward, public_inputs)
-    history = trainer.fit(round_batches, continual=continual)
-
-    mse_values = []
-    mae_values = []
-    with torch.no_grad():
-        for client, client_batches in zip(clients, round_batches[-1]):
-            for inputs, targets in client_batches:
-                predictions = forward(client.model, inputs.to(device))
-                expected = targets.to(device)
-                mse_values.append(F.mse_loss(predictions, expected).item())
-                mae_values.append(F.l1_loss(predictions, expected).item())
-    return history, sum(mse_values) / len(mse_values), sum(mae_values) / len(mae_values)
+    trainer = ContinualFedMixer(clients, forward)
+    history = []
+    error_matrix = [[{} for _ in test_rounds] for _ in clients]
+    for round_index in range(len(round_batches)):
+        history.extend(trainer.fit(
+            [round_batches[round_index]], continual=continual,
+            start_round=round_index + 1))
+        with torch.no_grad():
+            for client_index, client in enumerate(clients):
+                for test_index in range(round_index + 1):
+                    batches = test_rounds[test_index][client_index]
+                    errors = [
+                        F.mse_loss(forward(client.model, inputs.to(device)), targets.to(device)).item()
+                        for inputs, targets in batches
+                    ]
+                    error_matrix[client_index][round_index][test_index] = (
+                        sum(errors) / len(errors) if errors else float('nan'))
+    diagonal = [error_matrix[client][index][index]
+                for client in range(len(clients)) for index in range(len(test_rounds))]
+    final_errors = [error_matrix[client][-1][index]
+                    for client in range(len(clients)) for index in range(len(test_rounds) - 1)]
+    historical_diagonal = [error_matrix[client][index][index]
+                           for client in range(len(clients))
+                           for index in range(len(test_rounds) - 1)]
+    ace = sum(diagonal) / len(diagonal)
+    bwt = (sum(final_errors) / len(final_errors)
+           - sum(historical_diagonal) / len(historical_diagonal)) if historical_diagonal else 0.0
+    return history, ace, bwt
 
 
 def main():
@@ -73,13 +92,13 @@ def main():
     parser.add_argument('--data-dir', default='./data/electricity_federated')
     parser.add_argument('--clients', type=int, default=2)
     parser.add_argument('--rounds', type=int, default=4)
-    parser.add_argument('--limit', type=int, default=1000)
+    parser.add_argument('--limit', type=int, default=4000)
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--mode', choices=['baseline', 'continual', 'both'], default='both')
     parser.add_argument('--output', default='./output/output.log')
     args = parser.parse_args()
     device = torch.device(args.device)
-    round_batches = build_rounds(args.data_dir, args.clients, args.rounds, args.limit)
+    round_batches, test_rounds = build_rounds(args.data_dir, args.clients, args.rounds, args.limit)
 
     variants = {
         'baseline': [('FedMixer baseline', False)],
@@ -88,9 +107,9 @@ def main():
     }
     output_lines = []
     for name, continual in variants[args.mode]:
-        history, mse, mae = run_variant(round_batches, device, continual, seed=2021)
-        output_lines.append('{}: MSE={:.6f} MAE={:.6f} final_clusters={} memory={}'.format(
-            name, mse, mae, history[-1]['clusters'], history[-1]['memory']))
+        history, ace, bwt = run_variant(round_batches, test_rounds, device, continual, seed=2021)
+        output_lines.append('{}: ACE_MSE={:.6f} BWT={:.6f} final_clusters={} memory={}'.format(
+            name, ace, bwt, history[-1]['clusters'], history[-1]['memory']))
 
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     with open(args.output, 'a', encoding='utf-8') as handle:

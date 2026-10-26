@@ -48,8 +48,7 @@ def main():
     def forward(model, inputs):
         return model(inputs, None, None, None)
 
-    public_inputs = round_batches[0][0][0][0]
-    trainer = ContinualFedMixer(clients, forward, public_inputs)
+    trainer = ContinualFedMixer(clients, forward)
     for result in trainer.fit(round_batches):
         print('round={} clusters={} losses={} drifted={} memory={}'.format(
             result['round'], result['clusters'],

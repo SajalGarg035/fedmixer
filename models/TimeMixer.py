@@ -151,7 +151,7 @@ class PastDecomposableMixing(nn.Module):
             nn.Linear(in_features=configs.d_ff, out_features=configs.d_model),
         )
 
-    def forward(self, x_list):
+    def forward(self, x_list, return_components=False):
         length_list = []
         for x in x_list:
             _, T, _ = x.size()
@@ -180,6 +180,8 @@ class PastDecomposableMixing(nn.Module):
             if self.channel_independence:
                 out = ori + self.out_cross_layer(out)
             out_list.append(out[:, :length, :])
+        if return_components:
+            return out_list, season_list, trend_list
         return out_list
 
 
@@ -328,7 +330,8 @@ class Model(nn.Module):
 
         return x_enc, x_mark_enc
 
-    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
+    def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec,
+                return_multiscale=False):
 
         if self.use_future_temporal_feature:
             if self.channel_independence == 1:
@@ -372,15 +375,31 @@ class Model(nn.Module):
                 enc_out_list.append(enc_out)
 
         # Past Decomposable Mixing as encoder for past
+        seasonal_components = []
+        trend_components = []
         for i in range(self.layer):
-            enc_out_list = self.pdm_blocks[i](enc_out_list)
+            if return_multiscale:
+                enc_out_list, seasonal, trend = self.pdm_blocks[i](
+                    enc_out_list, return_components=True)
+                seasonal_components.append(seasonal)
+                trend_components.append(trend)
+            else:
+                enc_out_list = self.pdm_blocks[i](enc_out_list)
 
         # Future Multipredictor Mixing as decoder for future
         dec_out_list = self.future_multi_mixing(B, enc_out_list, x_list)
 
         dec_out = torch.stack(dec_out_list, dim=-1).sum(-1)
         dec_out = self.normalize_layers[0](dec_out, 'denorm')
+        if return_multiscale:
+            return dec_out, dec_out_list, seasonal_components, trend_components
         return dec_out
+
+    def forecast_multiscale(self, x_enc, x_mark_enc=None, x_dec=None,
+                            x_mark_dec=None):
+        """Return the forecast, scale forecasts, and PDM components."""
+        return self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec,
+                             return_multiscale=True)
 
     def future_multi_mixing(self, B, enc_out_list, x_list):
         dec_out_list = []
