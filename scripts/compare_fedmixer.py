@@ -37,9 +37,9 @@ def build_rounds(data_dir, client_count, rounds, limit):
             values, 1, rounds, 96, 96, batch_size=32,
             return_evaluation=True, standardize=True)
         client_batches.append((train_rounds, test_rounds))
-    train_batches = [[client_batches[index][0][round_index]
+    train_batches = [[client_batches[index][0][round_index][0]
                       for index in range(client_count)] for round_index in range(rounds)]
-    test_batches = [[client_batches[index][1][round_index]
+    test_batches = [[client_batches[index][1][round_index][0]
                      for index in range(client_count)] for round_index in range(rounds)]
     return train_batches, test_batches
 
