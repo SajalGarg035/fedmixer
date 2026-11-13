@@ -127,7 +127,8 @@ def prepare(output, client_limit, max_rows, rounds, seq_len, pred_len):
                 valid = False
                 break
 
-        if valid and values:
+        value_only = [value for _, value in values]
+        if valid and values and max(value_only) > min(value_only):
             complete.append((client_id, values))
 
         if len(complete) >= client_limit:
@@ -135,7 +136,8 @@ def prepare(output, client_limit, max_rows, rounds, seq_len, pred_len):
 
     if len(complete) < client_limit:
         raise RuntimeError(
-            'only {} complete clients found'.format(len(complete))
+            'only {} varying complete clients found; increase --max-rows or use --max-rows 0'.format(
+                len(complete))
         )
 
     clients_dir = os.path.join(output, 'clients')
@@ -224,8 +226,8 @@ def main():
     parser.add_argument(
         '--max-rows',
         type=int,
-        default=1000,
-        help='rows to keep per client; use 0 for the full archive'
+        default=0,
+        help='rows to keep per client; use 0 for the full archive (recommended)'
     )
 
     parser.add_argument(

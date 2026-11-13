@@ -17,7 +17,7 @@ from models.TimeMixer import Model
 def make_model():
     configs = SimpleNamespace(
         task_name='long_term_forecast', seq_len=4, label_len=1, pred_len=1,
-        down_sampling_window=1, down_sampling_layers=0, channel_independence=1,
+        down_sampling_window=2, down_sampling_layers=1, channel_independence=1,
         e_layers=1, moving_avg=3, enc_in=1, c_out=1, use_future_temporal_feature=0,
         d_model=8, embed='timeF', freq='h', dropout=0.0, use_norm=1,
         decomp_method='moving_avg', d_ff=16, top_k=3, factor=1,
@@ -33,6 +33,7 @@ def main():
     parser.add_argument('--limit', type=int, default=64)
     parser.add_argument('--clients', type=int, default=2)
     parser.add_argument('--rounds', type=int, default=2)
+    parser.add_argument('--method', choices=['legacy', 'proposed'], default='legacy')
     args = parser.parse_args()
 
     values = load_csv_series(args.csv, args.target, args.limit)
@@ -43,17 +44,25 @@ def main():
         clients.append(ContinualClient(
             model, torch.optim.SGD(model.parameters(), lr=0.01),
             torch.device('cpu'), memory_size=32, memory_batch_size=4,
-            memory_weight=0.2, distill_weight=0.1, drift_threshold=0.5))
+            memory_weight=0.2, distill_weight=0.1, drift_threshold=0.5,
+            replay_enabled=args.method == 'legacy'))
 
     def forward(model, inputs):
         return model(inputs, None, None, None)
 
-    trainer = ContinualFedMixer(clients, forward)
+    trainer = ContinualFedMixer(
+        clients, forward, method=args.method,
+        distribution_memory_kwargs={'max_entries': 8, 'temperature': 1.0,
+                                    'top_k': 3,
+                                    'variance_weight': 0.5,
+                                    'min_similarity': 0.1})
     for result in trainer.fit(round_batches):
-        print('round={} clusters={} losses={} drifted={} memory={}'.format(
+        print('round={} clusters={} losses={} drifted={} memory={} '
+              'distribution_entries={} distribution_bytes={} loss_components={}'.format(
             result['round'], result['clusters'],
-            [round(loss, 5) for loss in result['losses']],
-            result['drifted'], result['memory']))
+            [round(loss, 5) for loss in result['losses']], result['drifted'],
+            result['memory'], result['distribution_entries'],
+            result['distribution_bytes'], result['loss_components']))
 
 
 if __name__ == '__main__':

@@ -32,7 +32,16 @@ def build_rounds(data_dir, client_count, rounds, limit):
     client_batches = []
     for client_index in range(client_count):
         path = Path(data_dir) / 'clients' / 'client_{:03d}.csv'.format(client_index)
-        values = load_csv_series(path, target='load', limit=limit)
+        full_values = load_csv_series(path, target='load')
+        if full_values.std() <= 1e-6:
+            raise ValueError(
+                '{} is constant (std={:.3g}); regenerate the dataset with --max-rows 0'.format(
+                    path, full_values.std().item()))
+        values = full_values[:limit] if limit else full_values
+        if values.std() <= 1e-6:
+            raise ValueError(
+                '--limit {} selects a constant prefix of {}; use --limit 0 for the full timeline'.format(
+                    limit, path))
         train_rounds, test_rounds = make_rounds(
             values, 1, rounds, 96, 96, batch_size=32,
             return_evaluation=True, standardize=True)
@@ -68,12 +77,16 @@ def run_variant(round_batches, test_rounds, device, continual, seed):
             for client_index, client in enumerate(clients):
                 for test_index in range(round_index + 1):
                     batches = test_rounds[test_index][client_index]
-                    errors = [
-                        F.mse_loss(forward(client.model, inputs.to(device)), targets.to(device)).item()
+                    batch_errors = [
+                        (F.mse_loss(predictions, targets.to(device)).item(),
+                         F.l1_loss(predictions, targets.to(device)).item())
                         for inputs, targets in batches
+                        for predictions in [forward(client.model, inputs.to(device))]
                     ]
                     error_matrix[client_index][round_index][test_index] = (
-                        sum(errors) / len(errors) if errors else float('nan'))
+                        (sum(error[0] for error in batch_errors) / len(batch_errors),
+                         sum(error[1] for error in batch_errors) / len(batch_errors))
+                        if batch_errors else (float('nan'), float('nan')))
     diagonal = [error_matrix[client][index][index]
                 for client in range(len(clients)) for index in range(len(test_rounds))]
     final_errors = [error_matrix[client][-1][index]
@@ -81,10 +94,18 @@ def run_variant(round_batches, test_rounds, device, continual, seed):
     historical_diagonal = [error_matrix[client][index][index]
                            for client in range(len(clients))
                            for index in range(len(test_rounds) - 1)]
-    ace = sum(diagonal) / len(diagonal)
-    bwt = (sum(final_errors) / len(final_errors)
-           - sum(historical_diagonal) / len(historical_diagonal)) if historical_diagonal else 0.0
-    return history, ace, bwt
+    ace_mse = sum(error[0] for error in diagonal) / len(diagonal)
+    ace_mae = sum(error[1] for error in diagonal) / len(diagonal)
+    bwt_mse = (sum(error[0] for error in final_errors) / len(final_errors)
+               - sum(error[0] for error in historical_diagonal) / len(historical_diagonal)) \
+        if historical_diagonal else 0.0
+    bwt_mae = (sum(error[1] for error in final_errors) / len(final_errors)
+               - sum(error[1] for error in historical_diagonal) / len(historical_diagonal)) \
+        if historical_diagonal else 0.0
+    round_mse = [sum(error_matrix[client][index][index][0]
+                     for client in range(len(clients))) / len(clients)
+                 for index in range(len(test_rounds))]
+    return history, ace_mse, ace_mae, bwt_mse, bwt_mae, round_mse
 
 
 def main():
@@ -92,12 +113,16 @@ def main():
     parser.add_argument('--data-dir', default='./data/electricity_federated')
     parser.add_argument('--clients', type=int, default=2)
     parser.add_argument('--rounds', type=int, default=4)
-    parser.add_argument('--limit', type=int, default=4000)
+    parser.add_argument('--limit', type=int, default=0,
+                        help='rows per client; use 0 for the full prepared dataset')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--mode', choices=['baseline', 'continual', 'both'], default='both')
     parser.add_argument('--output', default='./output/output.log')
     args = parser.parse_args()
     device = torch.device(args.device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        print('CUDA requested but unavailable in this PyTorch environment; using CPU.')
+        device = torch.device('cpu')
     round_batches, test_rounds = build_rounds(args.data_dir, args.clients, args.rounds, args.limit)
 
     variants = {
@@ -107,9 +132,16 @@ def main():
     }
     output_lines = []
     for name, continual in variants[args.mode]:
-        history, ace, bwt = run_variant(round_batches, test_rounds, device, continual, seed=2021)
-        output_lines.append('{}: ACE_MSE={:.6f} BWT={:.6f} final_clusters={} memory={}'.format(
-            name, ace, bwt, history[-1]['clusters'], history[-1]['memory']))
+        (history, ace_mse, ace_mae, bwt_mse,
+         bwt_mae, round_mse) = run_variant(
+            round_batches, test_rounds, device, continual, seed=2021)
+        output_lines.append(
+            '{}: ACE_MSE={:.6f} ACE_MAE={:.6f} BWT_MSE={:.6f} BWT_MAE={:.6f} '
+            'round_MSE={} seasonal_clusters={} trend_clusters={} memory={}'.format(
+                name, ace_mse, ace_mae, bwt_mse, bwt_mae,
+                [round(value, 6) for value in round_mse],
+                history[-1]['seasonal_clusters'], history[-1]['trend_clusters'],
+                history[-1]['memory']))
 
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     with open(args.output, 'a', encoding='utf-8') as handle:

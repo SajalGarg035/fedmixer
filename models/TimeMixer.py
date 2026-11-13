@@ -401,6 +401,31 @@ class Model(nn.Module):
         return self.forecast(x_enc, x_mark_enc, x_dec, x_mark_dec,
                              return_multiscale=True)
 
+    @staticmethod
+    def _representation_from_components(seasonal_components,
+                                        trend_components, fallback):
+        components = []
+        for component_group in (seasonal_components, trend_components):
+            for layer_components in component_group:
+                for component in layer_components:
+                    components.append(component.float().mean(dim=(1, 2)))
+        if not components:
+            return fallback.float().reshape(fallback.shape[0], -1).mean(dim=1, keepdim=True)
+        return torch.stack(components, dim=1)
+
+    def encode(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None):
+        """Return a fixed-width, batch-first representation of the backbone."""
+        output = self.forecast_multiscale(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        return self._representation_from_components(output[2], output[3], output[0])
+
+    def forward_with_representation(self, x_enc, x_mark_enc=None, x_dec=None,
+                                    x_mark_dec=None):
+        """Return the unchanged forecast together with its backbone representation."""
+        output = self.forecast_multiscale(x_enc, x_mark_enc, x_dec, x_mark_dec)
+        representation = self._representation_from_components(
+            output[2], output[3], output[0])
+        return output[0], representation
+
     def future_multi_mixing(self, B, enc_out_list, x_list):
         dec_out_list = []
         if self.channel_independence == 1:

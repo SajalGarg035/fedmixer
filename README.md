@@ -103,6 +103,50 @@ TimeMixer as a fully MLP-based architecture with **Past-Decomposable-Mixing (PDM
 The TimeMixer backbone is unchanged. The opt-in continual layer adds bounded replay memory,
 mean-shift drift detection, clustered averaging, and prediction-space mutual distillation.
 
+The replay-free proposed mode is available through
+`ContinualFedMixer(..., method='proposed')`. It does not construct or populate
+`SpectralCoresetMemory`; instead each client keeps bounded diagonal-Gaussian
+representation summaries in `DistributionMemory`. A frozen copy of the first
+post-aggregation backbone provides the common representation space. Historical
+teacher and representation losses use the current incoming batch, with their
+weights modulated by retrieved distribution similarity. The legacy `legacy` mode
+continues to use raw replay for comparison.
+
+For the CSV smoke runner:
+
+```text
+python scripts/run_continual_csv.py --method proposed
+```
+
+Its Fourier probes are independently generated synthetic anchors, not slices of
+client windows. Real-data experiments should provide an independently sourced
+anchor tensor; private training windows must not be treated as public anchors.
+
+### GSOD seasonal task pipeline
+
+The upstream [data_fcl pipeline](./data_fcl_pipeline/README.md) is cloned into
+`data_fcl_pipeline/`. It downloads and prepares NOAA GSOD station data into
+chronological station-season NPZ tasks:
+
+```text
+.\scripts\prepare_gsod.ps1 `
+  -StartYear 2010 -EndYear 2019 `
+  -ArchiveDir "C:\Data\GSOD" `
+  -RawDir .\data\global_surface\raw `
+  -ProcessedDir .\data\global_surface\processed
+python scripts\run_data_fcl.py --processed-dir .\data\global_surface\processed --method proposed
+```
+
+Add `-Stations 01000000001 01000000002` to restrict extraction to selected
+11-digit NOAA station IDs. NOAA archives are large; choose the year range and
+stations before downloading.
+
+`load_season_rounds()` reads those NPZ files without loading test arrays into
+training. Missing station-season tasks remain inactive (`None`) and are
+excluded from federated aggregation; they are never replaced with zero data.
+For real GSOD experiments, public-anchor transfer is disabled unless an
+independently sourced `--public-anchor-npz` is supplied.
+
 ### Complete SSH/GPU workflow
 
 From the repository root on the SSH machine:
@@ -129,7 +173,7 @@ chronological continual-learning tasks:
 python scripts/download_electricity_federated.py \
   --output ./data/electricity_federated \
   --clients 10 \
-  --max-rows 1000 \
+  --max-rows 0 \
   --rounds 4 \
   --seq-len 96 \
   --pred-len 96
@@ -144,8 +188,9 @@ find data/electricity_federated/clients -name '*.csv' | wc -l
 ```
 
 The downloader is non-interactive and SSH-safe. Use `--max-rows 0` for the full archive. The
-paper uses 89 complete clients, 15-minute samples, and 96 input plus 96 prediction steps; the
-default command above deliberately uses only 10 clients and 1,000 rows for development.
+paper uses 89 complete clients, 15-minute samples, and 96 input plus 96 prediction steps.
+Full timelines are recommended because early household streams can contain long zero-valued
+prefixes that are not useful for comparison.
 
 Run the ten-value component smoke test without a dataset:
 
@@ -159,7 +204,7 @@ Run the generic compact TimeMixer CSV smoke runner on any numeric CSV:
 python scripts/run_continual_csv.py \
   --csv ./data/electricity_federated/clients/client_000.csv \
   --target load \
-  --limit 1000 \
+  --limit 0 \
   --clients 2 \
   --rounds 2
 ```
@@ -174,7 +219,7 @@ python scripts/compare_fedmixer.py \
   --data-dir ./data/electricity_federated \
   --clients 2 \
   --rounds 4 \
-  --limit 1000 \
+  --limit 0 \
   --device cuda \
   --mode baseline \
   --output ./output/output.log
@@ -187,7 +232,7 @@ python scripts/compare_fedmixer.py \
   --data-dir ./data/electricity_federated \
   --clients 2 \
   --rounds 4 \
-  --limit 1000 \
+  --limit 0 \
   --device cuda \
   --mode continual \
   --output ./output/output.log
@@ -210,8 +255,8 @@ The baseline keeps clustered averaging and mutual distillation but disables repl
 and drift detection. The continual variant enables both. The selected results are printed to
 the terminal and written to `output/output.log`; the output directory is created automatically.
 
-The commands above are smoke runs using 1,000 rows per client. To run the full Electricity
-archive, prepare all rows and clients first:
+The comparison commands above use the full prepared timeline. To prepare the complete
+Electricity archive and all clients first:
 
 ```bash
 python scripts/download_electricity_federated.py \

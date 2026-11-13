@@ -67,7 +67,7 @@ Only `TimeMixer` is registered in `exp/exp_basic.py`, although the CLI help text
   - continual mode: decoupled aggregation, synthetic-probe distillation, replay, drift detection, and gradient projection;
   - both: runs both variants using the same round data.
 7. Evaluates each client after every round on all chronological held-out rounds seen so far.
-8. Reports ACE_MSE and BWT in the output log.
+8. Reports ACE/BWT for both MSE and MAE, plus diagonal per-round MSE values, in the output log.
 9. Appends a short summary to the requested output log.
 
 The baseline is therefore not plain local training. It still uses the shared server aggregation and prediction-space distillation; it only passes `continual=False` to the trainer.
@@ -427,6 +427,37 @@ The federated classes are exported by `continual_federated/__init__.py`:
 - `FedMixerServer`
 - `ContinualFedMixer`
 
+### Replay-free proposed mode
+
+`ContinualFedMixer(..., method='proposed')` is the replay-free path described in
+`imp.md`. It does not construct `SpectralCoresetMemory`. Each client instead
+owns a bounded `DistributionMemory` containing only diagonal-Gaussian
+representation summaries (`mean`, `log_variance`, sample count, task ID,
+temporal signature, and metadata). The summary is produced in a single frozen
+reference-encoder space initialized after the first aggregated round; raw
+windows are discarded after encoding.
+
+At each later round, the current windows are encoded by that frozen reference
+encoder and compared with the client's stored summaries. The top-k similarity
+controls a bounded retention coefficient. The live model is trained on the
+current batch with forecast loss plus prediction-teacher and representation
+moment losses against the latest previous-task teacher. Teacher evaluation is
+detached, while student representations retain gradients. Mutual targets are
+generated and consumed on the exact same independently generated Fourier
+anchor tensor. The default `legacy` mode continues to instantiate and use raw
+replay for baseline comparison.
+
+### data_fcl seasonal integration
+
+The cloned `data_fcl_pipeline/` prepares NOAA GSOD station-season NPZ files.
+`continual_federated.data_fcl.load_season_rounds()` groups those files by
+chronological `season_start`, returns training and evaluation batches
+separately, and represents missing station-season tasks with `None`. The
+trainer's active-client aggregation excludes those entries instead of
+injecting zero-valued data. `scripts/run_data_fcl.py` is the end-to-end runner;
+it disables generated public anchors for real GSOD data unless an independent
+anchor NPZ is provided explicitly.
+
 The expected trainer input is:
 
 ```text
@@ -456,7 +487,7 @@ round_batches[round_index][client_index] = [(inputs, targets), ...]
 3. Computes current-batch MSE.
 4. If replay is enabled and memory is nonempty, samples stored windows and adds target replay MSE plus old-prediction dark-knowledge MSE.
 5. If distillation inputs and targets are supplied, adds prediction-space MSE against the synthetic-probe ensemble target.
-6. Backpropagates, consolidates drift-triggered directions, projects gradients away from stored directions, and steps the optimizer.
+6. Backpropagates, consolidates drift-triggered directions, projects stable-regime gradients away from stored directions, and steps the optimizer. A detected drift batch is allowed to use its full gradient so the new regime can adapt even when a parameter's protected basis is full-rank.
 7. If replay is enabled, stores the current input, target, and prediction in memory.
 8. Returns the detached scalar loss.
 
@@ -574,9 +605,10 @@ are:
 - `BWT`: the final-round historical error minus the corresponding earlier diagonal error,
   averaged over clients and all non-final rounds. Positive values indicate forgetting.
 
-The comparison output now reports `ACE_MSE` and `BWT` instead of final-round training-batch
-MSE/MAE. The standard `make_rounds()` return remains backward-compatible for callers that
-do not request evaluation splits.
+The comparison output reports `ACE_MSE`, `ACE_MAE`, `BWT_MSE`, `BWT_MAE`, and diagonal
+`round_MSE` values instead of final-round training-batch metrics. The standard
+`make_rounds()` return remains backward-compatible for callers that do not request
+evaluation splits.
 
 ## 7. Continual Flags in Standard Training
 
@@ -614,7 +646,11 @@ The preparation process:
 8. Counts the valid windows for each range.
 9. Writes `manifest.json` containing source, sampling, client, task, and window metadata.
 
-The downloader default is 10 clients, 1,000 rows, 4 rounds, sequence length 96, and prediction length 96. For the held-out federated comparison, each client-round chunk must be large enough for both 80% training and 20% prediction windows; the comparison runner therefore defaults to 4,000 rows. `--max-rows 0` means use the full archive.
+The downloader and comparison runner default to the full archive (`--max-rows 0` and
+`--limit 0`). This is important because the beginning of some Electricity household
+streams contains long zero-valued periods. The downloader rejects constant clients, and
+the comparison runner rejects a limited prefix whose standard deviation is zero. For a
+meaningful comparison, use the full timeline rather than the old 1,000/4,000-row prefix.
 
 The manifest is metadata only. The federated runners reconstruct windows from CSV values through `load_csv_series()` and `make_rounds()`.
 
@@ -723,8 +759,9 @@ These are concrete properties of the current code, not proposed fixes:
 5. The current signature cluster count is bounded by `min(3, number_of_clients)`; it is not yet selected with a full eigengap heuristic.
 6. The detector uses input-window decompositions rather than hooks into every internal PDM activation.
 7. Orthogonal consolidation uses stable-batch parameter-gradient directions rather than activation covariance from a dedicated layer hook.
-8. The CSV evaluation split is chronological and standardized, but the comparison currently reports MSE ACE/BWT rather than the full proposed MAE/ACE metric suite.
+8. The CSV evaluation split is chronological and standardized; reported metrics are on that normalized scale.
 9. The active generic client loss uses final-output replay/distillation for models without `forecast_multiscale()`.
+10. Constant clients and constant limited prefixes are rejected because they cannot support a meaningful comparison.
 11. The standard custom dataset requires `date`; the federated CSV loader does not.
 12. Downsampling dimensions must remain compatible with integer temporal lengths and all constructed linear layers.
 13. Moving-average decomposition works best with an odd kernel size; incompatible settings can cause shape problems.

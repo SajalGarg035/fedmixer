@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
+from copy import deepcopy
 
+from .distribution_memory import DistributionMemory
 from .drift import MultiscaleSpectralTrendDetector
 from .memory import OrthogonalSubspaceProjector, SpectralCoresetMemory
 
@@ -10,11 +12,16 @@ class ContinualClient:
 
     def __init__(self, model, optimizer, device, memory_size=200,
                  memory_batch_size=16, memory_weight=0.1, distill_weight=0.1,
-                 drift_threshold=0.15, trend_threshold=0.2):
+                 drift_threshold=0.15, trend_threshold=0.2,
+                 replay_enabled=True, distribution_memory=None):
         self.model = model
         self.optimizer = optimizer
         self.device = device
-        self.memory = SpectralCoresetMemory(memory_size)
+        self.replay_enabled = replay_enabled
+        self.memory_size = memory_size
+        self.memory = None
+        self.distribution_memory = distribution_memory
+        self.previous_teacher = None
         self.subspace_projector = OrthogonalSubspaceProjector()
         self.memory_batch_size = memory_batch_size
         self.memory_weight = memory_weight
@@ -51,6 +58,72 @@ class ContinualClient:
             return prediction, torch.stack(scale_predictions, dim=1)
         return forward_fn(self.model, inputs), None
 
+    @staticmethod
+    def _representation(model, inputs, forward_fn):
+        if hasattr(model, 'forward_with_representation'):
+            return model.forward_with_representation(inputs)
+        prediction = forward_fn(model, inputs)
+        return prediction, prediction.reshape(prediction.shape[0], -1)
+
+    def set_previous_teacher(self):
+        self.previous_teacher = deepcopy(self.model).to(self.device)
+        self.previous_teacher.eval()
+        for parameter in self.previous_teacher.parameters():
+            parameter.requires_grad_(False)
+
+    def train_batch_replay_free(self, inputs, targets, forward_fn,
+                                retention_weight=0.0, history_weight=0.3,
+                                representation_weight=0.1,
+                                distillation_inputs=None,
+                                distillation_targets=None):
+        inputs = inputs.to(self.device)
+        targets = targets.to(self.device)
+        self.model.train()
+        self.optimizer.zero_grad()
+        predictions, representation = self._representation(
+            self.model, inputs, forward_fn)
+        forecast_loss = F.mse_loss(predictions, targets)
+        history_loss = forecast_loss.new_zeros(())
+        representation_loss = forecast_loss.new_zeros(())
+        if self.previous_teacher is not None:
+            with torch.no_grad():
+                teacher_predictions, teacher_representation = self._representation(
+                    self.previous_teacher, inputs, forward_fn)
+            history_loss = F.mse_loss(predictions, teacher_predictions.detach())
+            representation_loss = self._moment_loss(
+                representation, teacher_representation.detach())
+        loss = (forecast_loss + history_weight * retention_weight * history_loss
+                + representation_weight * retention_weight * representation_loss)
+        mutual_loss = forecast_loss.new_zeros(())
+        if distillation_inputs is not None and distillation_targets is not None:
+            anchor_predictions, _ = self._representation(
+                self.model, distillation_inputs.to(self.device), forward_fn)
+            if isinstance(distillation_targets, tuple):
+                distillation_targets = distillation_targets[0]
+            mutual_loss = F.mse_loss(
+                anchor_predictions, distillation_targets.to(self.device))
+            loss = loss + self.distill_weight * mutual_loss
+        loss.backward()
+        self.optimizer.step()
+        return {
+            'total': loss.detach().item(),
+            'forecast': forecast_loss.detach().item(),
+            'history': history_loss.detach().item(),
+            'representation': representation_loss.detach().item(),
+            'mutual': mutual_loss.detach().item(),
+        }
+
+    @staticmethod
+    def _moment_loss(student, teacher):
+        student = student.reshape(student.shape[0], -1)
+        teacher = teacher.reshape(teacher.shape[0], -1)
+        if student.shape[1] != teacher.shape[1]:
+            raise ValueError('student and teacher representation widths differ')
+        mean_loss = F.mse_loss(student.mean(dim=0), teacher.mean(dim=0))
+        student_log_var = student.var(dim=0, unbiased=False).clamp_min(1e-6).log()
+        teacher_log_var = teacher.var(dim=0, unbiased=False).clamp_min(1e-6).log()
+        return mean_loss + 0.5 * F.mse_loss(student_log_var, teacher_log_var)
+
     def train_batch(self, inputs, targets, forward_fn, distillation_inputs=None,
                     distillation_targets=None, use_replay=True):
         inputs = inputs.to(self.device)
@@ -62,7 +135,9 @@ class ContinualClient:
         predictions, scale_predictions = self.forward_with_scales(inputs, forward_fn)
         loss = F.mse_loss(predictions, targets)
 
-        if use_replay:
+        if use_replay and self.replay_enabled and self.memory is None:
+            self.memory = SpectralCoresetMemory(self.memory_size)
+        if use_replay and self.memory is not None:
             replay = self.memory.sample(self.memory_batch_size, self.device)
             if replay is not None:
                 replay_inputs, replay_targets, old_predictions = replay
@@ -90,9 +165,13 @@ class ContinualClient:
         loss.backward()
         if not (self.last_drift[0] or self.last_drift[1]):
             self.subspace_projector.accumulate(self.model.named_parameters())
-        self.subspace_projector.project_gradients(self.model.named_parameters())
+        # A drift batch must retain its new-regime gradient. Projecting it
+        # against the just-consolidated stable basis can remove all usable
+        # directions for small parameters and prevent adaptation.
+        if not (self.last_drift[0] or self.last_drift[1]):
+            self.subspace_projector.project_gradients(self.model.named_parameters())
         self.optimizer.step()
-        if use_replay:
+        if use_replay and self.memory is not None:
             old_output = scale_predictions if scale_predictions is not None else predictions
             self.memory.add_batch(inputs, targets, old_output)
         return loss.detach().item()

@@ -4,6 +4,7 @@
 result_*.txt
 
 __pycache__/
+.venv/
 dataset/
 results/
 test_results/
@@ -13,6 +14,7 @@ data/electricity_federated/
 data/ETT/ETTh1_tiny.csv
 data/downloads/
 *.zip
+data/global_surface/
 
 # Generated experiment artifacts
 checkpoints/
