@@ -100,17 +100,44 @@ TimeMixer as a fully MLP-based architecture with **Past-Decomposable-Mixing (PDM
 
 ## Continual Federated TimeMixer
 
-The TimeMixer backbone is unchanged. The opt-in continual layer adds bounded replay memory,
-mean-shift drift detection, clustered averaging, and prediction-space mutual distillation.
+The TimeMixer forecasting path is unchanged. The opt-in federated layer supports legacy
+raw-sample replay, multiscale seasonal/trend drift detection, pathway aggregation, and
+prediction-space mutual distillation.
 
 The replay-free proposed mode is available through
 `ContinualFedMixer(..., method='proposed')`. It does not construct or populate
-`SpectralCoresetMemory`; instead each client keeps bounded diagonal-Gaussian
-representation summaries in `DistributionMemory`. A frozen copy of the first
-post-aggregation backbone provides the common representation space. Historical
-teacher and representation losses use the current incoming batch, with their
-weights modulated by retrieved distribution similarity. The legacy `legacy` mode
-continues to use raw replay for comparison.
+`SpectralCoresetMemory`. Each client retains a bounded set of diagonal-Gaussian summaries
+of TimeMixer post-PDM representations. A frozen encoder is initialized from the
+sample-weighted state of all active clients after their first local updates and before
+pathway personalization. Historical raw inputs and targets are not retained.
+
+For query summary \((\mu_q, \ell_q)\) and stored summary \((\mu_j, \ell_j)\),
+the code computes \(d_j = \operatorname{MSE}(\mu_q,\mu_j) +
+\beta\operatorname{MSE}(\ell_q,\ell_j)\), similarity
+\(s_j=\exp(-d_j/\tau)\), and normalized top-k weights
+\(w_j=s_j/\sum_i s_i\). The retention factor is
+\(r=s_{min}+(1-s_{min})\sum_j w_js_j\). Similarity affects the strength of
+the historical teacher and representation losses; it is not itself a distribution-matching
+loss. Mutual distillation is a separate prediction loss on independent synthetic probes
+or caller-supplied independent anchors.
+
+The objective is \(L=L_{forecast}+\lambda_h rL_{history}+
+\lambda_r rL_{representation}+\lambda_m L_{mutual}\). The first two teacher
+terms use a per-client frozen snapshot of its post-aggregation model from the previous
+round. Switches independently control history, representation, mutual distillation, and
+retention weighting. Recurring near-identical summaries update an existing regime entry's
+statistics and occurrence count rather than consuming another slot. The legacy mode keeps
+raw replay for baseline comparison.
+
+The fixed TimeMixer configuration requires a consistent `seq_len` and `enc_in`; a mismatch
+is rejected explicitly. Channel-independent features are combined into one representation
+per input window. Distribution memory is \(O(KD)\) per client for K entries of width D,
+in addition to each client model, any required previous-round teacher, and the frozen
+reference model. The implementation is raw-sample-replay-free, not memory-free.
+
+The proposed path does not use `OrthogonalSubspaceProjector`. Gradient projection remains
+in the legacy client path only. Cluster adapters, soft memberships, and compatibility-aware
+cross-cluster transfer are not implemented.
 
 For the CSV smoke runner:
 
@@ -121,6 +148,21 @@ python scripts/run_continual_csv.py --method proposed
 Its Fourier probes are independently generated synthetic anchors, not slices of
 client windows. Real-data experiments should provide an independently sourced
 anchor tensor; private training windows must not be treated as public anchors.
+
+For an independent controlled experiment with stable, gradual, abrupt, recurring,
+heterogeneous, and missing-client tasks, run:
+
+```text
+python scripts/synthetic_fcl_experiment.py
+```
+
+This is mechanism validation only, not evidence of real-world forecasting superiority.
+The synthetic runner uses two distinct local training batches per task so its teacher
+and probe distillation losses are exercised. It saves the four-way method comparison,
+all four proposed component ablations, their per-seed metrics, loss-component means,
+and mean/sample-standard-deviation summaries as JSON. The Electricity comparison
+also defaults to five seeds; add `--mode ablation` for the full method and its four
+component ablations, using the same `--seeds` list for matched runs.
 
 ### GSOD seasonal task pipeline
 

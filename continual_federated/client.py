@@ -37,7 +37,9 @@ class ContinualClient:
         self.last_drift = (False, False)
         self.last_seasonal_drift = False
         self.last_trend_drift = False
-        self._round_signatures = []
+        self._seasonal_signature_sum = None
+        self._trend_signature_sum = None
+        self._round_sample_count = 0
         self.last_drift_distances = (0.0, 0.0)
 
     def begin_round(self):
@@ -45,21 +47,30 @@ class ContinualClient:
         self.last_trend_drift = False
         self.last_drift = (False, False)
         self.last_signatures = (None, None)
-        self._round_signatures = []
+        self._seasonal_signature_sum = None
+        self._trend_signature_sum = None
+        self._round_sample_count = 0
 
     def accumulate_drift(self, inputs):
         seasonal, trend = self.drift_detector.signatures(inputs)
         count = int(inputs.shape[0])
-        self._round_signatures.append((seasonal, trend, count))
+        if self._seasonal_signature_sum is None:
+            self._seasonal_signature_sum = torch.zeros_like(seasonal)
+            self._trend_signature_sum = torch.zeros_like(trend)
+        if (seasonal.shape != self._seasonal_signature_sum.shape or
+                trend.shape != self._trend_signature_sum.shape):
+            raise ValueError('drift signature dimensions changed within a round')
+        self._seasonal_signature_sum.add_(seasonal, alpha=count)
+        self._trend_signature_sum.add_(trend, alpha=count)
+        self._round_sample_count += count
 
     def finalize_round_drift(self):
-        if not self._round_signatures:
+        if self._round_sample_count == 0:
             self.last_signatures = (None, None)
             self.last_drift = (False, False)
             return self.last_drift
-        total = sum(count for _, _, count in self._round_signatures)
-        seasonal = sum(value * count for value, _, count in self._round_signatures) / total
-        trend = sum(value * count for _, value, count in self._round_signatures) / total
+        seasonal = self._seasonal_signature_sum / self._round_sample_count
+        trend = self._trend_signature_sum / self._round_sample_count
         (seasonal_drift, trend_drift, seasonal, trend,
          seasonal_distance, trend_distance) = self.drift_detector.update_signatures(
             seasonal, trend)
@@ -69,7 +80,33 @@ class ContinualClient:
         self.last_signatures = (seasonal, trend)
         self.last_drift_distance = float(max(seasonal_distance, trend_distance))
         self.last_drift_distances = (float(seasonal_distance), float(trend_distance))
+        self._seasonal_signature_sum = None
+        self._trend_signature_sum = None
+        self._round_sample_count = 0
         return self.last_drift
+
+    @property
+    def persistent_drift_bytes(self):
+        signatures = (*self.last_signatures,
+                      self.drift_detector.previous_seasonal,
+                      self.drift_detector.previous_trend)
+        seen = set()
+        total = 0
+        for value in signatures:
+            if torch.is_tensor(value):
+                key = (value.device.type, value.device.index,
+                       value.untyped_storage().data_ptr(),
+                       value.untyped_storage().nbytes())
+                if key not in seen:
+                    seen.add(key)
+                    total += value.untyped_storage().nbytes()
+        return total
+
+    @property
+    def gradient_projection_bytes(self):
+        tensors = [*self.subspace_projector._bases.values(),
+                   *self.subspace_projector._pending.values()]
+        return sum(value.numel() * value.element_size() for value in tensors)
 
     def observe(self, inputs):
         seasonal, trend, seasonal_signature, trend_signature = self.drift_detector.update(inputs)
@@ -108,6 +145,8 @@ class ContinualClient:
                                 history_enabled=True,
                                 representation_enabled=True,
                                 mutual_enabled=True):
+        if not torch.isfinite(torch.tensor(retention_weight)) or not 0 <= retention_weight <= 1:
+            raise ValueError('retention_weight must be finite and in [0, 1]')
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         self.model.train()
@@ -140,6 +179,8 @@ class ContinualClient:
             mutual_loss = F.mse_loss(
                 anchor_predictions, distillation_targets.to(self.device))
             loss = loss + self.distill_weight * mutual_loss
+        if not torch.isfinite(loss):
+            raise FloatingPointError('replay-free training loss is not finite')
         loss.backward()
         self.optimizer.step()
         return {

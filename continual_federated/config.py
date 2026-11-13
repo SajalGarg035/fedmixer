@@ -24,6 +24,7 @@ def validate_config(config):
     distillation = config.setdefault('distillation', {})
     for key in ('history', 'representation', 'mutual'):
         distillation.setdefault(key, True)
+    distillation.setdefault('retention_weighting', True)
     for key in ('history_weight', 'representation_weight'):
         value = float(distillation.get(key, 0.0))
         if value < 0:

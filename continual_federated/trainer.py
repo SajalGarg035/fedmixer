@@ -20,7 +20,7 @@ class ContinualFedMixer:
                  history_weight=0.3, representation_weight=0.1,
                  generate_public_anchors=True, history_enabled=True,
                  representation_enabled=True, mutual_enabled=True,
-                 strategy='fedmixer'):
+                 strategy='fedmixer', retention_enabled=True):
         if not clients:
             raise ValueError('clients must not be empty')
         self.clients = clients
@@ -33,9 +33,14 @@ class ContinualFedMixer:
         self.method = method
         self.history_weight = history_weight
         self.representation_weight = representation_weight
+        if (history_weight < 0 or representation_weight < 0 or
+                not torch.isfinite(torch.tensor(
+                    [history_weight, representation_weight])).all()):
+            raise ValueError('distillation weights must be finite and non-negative')
         self.history_enabled = bool(history_enabled)
         self.representation_enabled = bool(representation_enabled)
         self.mutual_enabled = bool(mutual_enabled)
+        self.retention_enabled = bool(retention_enabled)
         if strategy not in ('fedavg', 'fedmixer'):
             raise ValueError("strategy must be 'fedavg' or 'fedmixer'")
         self.strategy = strategy
@@ -149,6 +154,13 @@ class ContinualFedMixer:
             states = [{name: value.detach().clone()
                        for name, value in self.clients[index].model.state_dict().items()}
                       for index in active_indices]
+            reference_global_state = None
+            if self.method == 'proposed' and self.reference_encoder is None:
+                # The first frozen representation space is a sample-weighted
+                # global state over every participant, even when FedMixer will
+                # subsequently personalize seasonal/trend pathways by cluster.
+                reference_global_state = self.server.average_cluster(
+                    states, list(range(len(states))), sample_counts)
             if self.strategy == 'fedavg':
                 average = self.server.average_cluster(
                     states, list(range(len(states))), sample_counts)
@@ -203,9 +215,10 @@ class ContinualFedMixer:
             if self.method == 'proposed':
                 self._record_distribution_summaries(
                     client_batches, seasonal_signatures, round_index,
-                    active_indices)
-                for client_index in active_indices:
-                    self.clients[client_index].set_previous_teacher()
+                    active_indices, reference_global_state)
+                if self.teacher_required:
+                    for client_index in active_indices:
+                        self.clients[client_index].set_previous_teacher()
 
             history.append({
                 'round': round_index,
@@ -216,6 +229,8 @@ class ContinualFedMixer:
                 'drifted': drifted,
                 'seasonal_drift': seasonal_drift,
                 'trend_drift': trend_drift,
+                'drift_distances': [
+                    client.last_drift_distances for client in self.clients],
                 'memory': [
                     len(client.memory) if client.memory is not None else 0
                     for client in self.clients],
@@ -251,21 +266,31 @@ class ContinualFedMixer:
 
     def _retention_weight(self, client_index, batches):
         if self.method != 'proposed' or self.reference_encoder is None:
-            return (0.0 if self.method == 'proposed' else 1.0), []
+            initial_weight = (0.0 if self.method == 'proposed' and
+                              self.retention_enabled else 1.0)
+            return initial_weight, []
         summary = self._current_summary(batches)
         retrieved = self.distribution_memories[client_index].retrieve(
             summary, top_k=self.distribution_top_k)
-        return self.distribution_memories[client_index].retention_weight(retrieved), [
+        weight = (self.distribution_memories[client_index].retention_weight(retrieved)
+                  if self.retention_enabled else 1.0)
+        return weight, [
             {'task_id': item['entry']['task_id'],
+             'last_task_id': item['entry'].get('last_task_id',
+                                                item['entry']['task_id']),
+             'occurrences': item['entry'].get('occurrences', 1),
              'similarity': item['similarity'], 'weight': item['weight']}
             for item in retrieved]
 
     def _record_distribution_summaries(self, client_batches, signatures, round_index,
-                                       active_indices):
+                                       active_indices, reference_global_state=None):
         if self.reference_encoder is None:
-            # Capture only after local training and federated aggregation.  The
-            # first active participant is guaranteed to have contributed.
+            # Use an active participant only as a compatible model container;
+            # load the synchronized all-client average into the frozen encoder.
             self.reference_encoder = deepcopy(self.clients[active_indices[0]].model)
+            if reference_global_state is None:
+                raise ValueError('first reference encoder requires global model state')
+            self.reference_encoder.load_state_dict(reference_global_state)
             self.reference_encoder.eval()
             for parameter in self.reference_encoder.parameters():
                 parameter.requires_grad_(False)
@@ -281,9 +306,18 @@ class ContinualFedMixer:
 
     def state_dict(self):
         return {
-            'schema_version': 2,
+            'schema_version': 3,
             'method': self.method,
             'strategy': self.strategy,
+            'configuration': {
+                'history_enabled': self.history_enabled,
+                'representation_enabled': self.representation_enabled,
+                'mutual_enabled': self.mutual_enabled,
+                'retention_enabled': self.retention_enabled,
+                'history_weight': self.history_weight,
+                'representation_weight': self.representation_weight,
+                'distribution_top_k': self.distribution_top_k,
+            },
             'reference_encoder': None if self.reference_encoder is None else
                 self.reference_encoder.state_dict(),
             'distribution_memories': [
@@ -291,28 +325,52 @@ class ContinualFedMixer:
             'teachers': [None if client.previous_teacher is None else
                          client.previous_teacher.state_dict()
                          for client in self.clients],
+            'drift_state': [{
+                'seasonal': client.drift_detector.previous_seasonal,
+                'trend': client.drift_detector.previous_trend,
+            } for client in self.clients],
             'server': {
                 'seasonal_clusters': deepcopy(self.server.seasonal_clusters),
                 'trend_clusters': deepcopy(self.server.trend_clusters),
             },
         }
 
+    @property
+    def teacher_required(self):
+        return self.method == 'proposed' and (
+            (self.history_enabled and self.history_weight > 0) or
+            (self.representation_enabled and self.representation_weight > 0))
+
     def load_state_dict(self, state):
         if not isinstance(state, dict):
             raise ValueError('trainer checkpoint must be a dictionary')
         schema_version = state.get('schema_version', 1)
-        if schema_version not in (1, 2):
+        if schema_version not in (1, 2, 3):
             raise ValueError('unsupported trainer checkpoint schema version')
         if state.get('method') != self.method:
             raise ValueError('trainer checkpoint method does not match')
         if schema_version >= 2 and state.get('strategy') != self.strategy:
             raise ValueError('trainer checkpoint strategy does not match')
+        if 'configuration' in state and state['configuration'] != {
+                'history_enabled': self.history_enabled,
+                'representation_enabled': self.representation_enabled,
+                'mutual_enabled': self.mutual_enabled,
+                'retention_enabled': self.retention_enabled,
+                'history_weight': self.history_weight,
+                'representation_weight': self.representation_weight,
+                'distribution_top_k': self.distribution_top_k}:
+            raise ValueError('trainer checkpoint loss or retrieval configuration differs')
         saved_memories = state.get('distribution_memories', [])
         if len(saved_memories) != len(self.distribution_memories):
             raise ValueError('trainer checkpoint client memory count does not match')
         if 'teachers' in state and len(state['teachers']) != len(self.clients):
             raise ValueError('trainer checkpoint teacher count does not match')
+        if 'drift_state' in state and len(state['drift_state']) != len(self.clients):
+            raise ValueError('trainer checkpoint drift-state count does not match')
         reference_state = state.get('reference_encoder')
+        if (self.method == 'proposed' and reference_state is None and
+                any(memory_state.get('entries') for memory_state in saved_memories)):
+            raise ValueError('checkpoint has distribution history but no reference encoder')
         if reference_state is not None:
             if self.reference_encoder is None:
                 self.reference_encoder = deepcopy(self.clients[0].model)
@@ -329,6 +387,11 @@ class ContinualFedMixer:
                 client.previous_teacher.eval()
                 for parameter in client.previous_teacher.parameters():
                     parameter.requires_grad_(False)
+        for client, drift_state in zip(self.clients, state.get('drift_state', [])):
+            client.drift_detector.previous_seasonal = deepcopy(
+                drift_state.get('seasonal'))
+            client.drift_detector.previous_trend = deepcopy(
+                drift_state.get('trend'))
         server_state = state.get('server', {})
         self.server.seasonal_clusters = deepcopy(server_state.get('seasonal_clusters'))
         self.server.trend_clusters = deepcopy(server_state.get('trend_clusters'))
@@ -348,23 +411,80 @@ class ContinualFedMixer:
         return set(client_indices).issubset(members)
 
     @staticmethod
-    def _module_bytes(module):
+    def _storage_key(tensor):
+        storage = tensor.untyped_storage()
+        return (tensor.device.type, tensor.device.index,
+                storage.data_ptr(), storage.nbytes())
+
+    @classmethod
+    def _module_bytes(cls, module, seen=None):
         if module is None:
             return 0
-        return sum(tensor.numel() * tensor.element_size()
-                   for tensor in module.state_dict().values()
-                   if torch.is_tensor(tensor))
+        seen = set() if seen is None else seen
+        total = 0
+        for tensor in module.state_dict().values():
+            if torch.is_tensor(tensor):
+                key = cls._storage_key(tensor)
+                if key not in seen:
+                    seen.add(key)
+                    total += tensor.untyped_storage().nbytes()
+        return total
+
+    @classmethod
+    def _state_bytes(cls, value, seen=None):
+        seen = set() if seen is None else seen
+        if torch.is_tensor(value):
+            key = cls._storage_key(value)
+            if key in seen:
+                return 0
+            seen.add(key)
+            return value.untyped_storage().nbytes()
+        if isinstance(value, dict):
+            return sum(cls._state_bytes(item, seen) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(cls._state_bytes(item, seen) for item in value)
+        return 0
 
     def _memory_accounting(self):
         replay = sum(client.memory.byte_count if client.memory is not None else 0
                      for client in self.clients)
         distribution = sum(memory.byte_count for memory in self.distribution_memories)
-        reference = self._module_bytes(self.reference_encoder)
-        teachers = sum(self._module_bytes(client.previous_teacher)
+        model_seen = set()
+        client_models = sum(self._module_bytes(client.model, model_seen)
+                            for client in self.clients)
+        reference = self._module_bytes(self.reference_encoder, model_seen)
+        teachers = sum(self._module_bytes(client.previous_teacher, model_seen)
                        for client in self.clients)
-        return {'replay_bytes': replay, 'distribution_bytes': distribution,
-                'reference_encoder_bytes': reference, 'teacher_bytes': teachers,
-                'total_bytes': replay + distribution + reference + teachers}
+        optimizer_seen = set()
+        optimizer = sum(self._state_bytes(client.optimizer.state, optimizer_seen)
+                        for client in self.clients)
+        projector_seen = set()
+        projection = sum(self._state_bytes(
+            (client.subspace_projector._bases,
+             client.subspace_projector._pending), projector_seen)
+            for client in self.clients)
+        drift_seen = set()
+        drift = sum(self._state_bytes(
+            (client.last_signatures,
+             client.drift_detector.previous_seasonal,
+             client.drift_detector.previous_trend), drift_seen)
+            for client in self.clients)
+        algorithmic = replay + distribution + reference + teachers + projection + drift
+        total = algorithmic + client_models + optimizer
+        return {
+            'replay_bytes': replay,
+            'distribution_bytes': distribution,
+            'reference_encoder_bytes': reference,
+            'teacher_bytes': teachers,
+            'client_model_bytes': client_models,
+            'optimizer_state_bytes': optimizer,
+            'gradient_projection_bytes': projection,
+            'drift_state_bytes': drift,
+            'algorithmic_memory_bytes': algorithmic,
+            'total_persistent_bytes': total,
+            # Kept as an alias for existing consumers of round history.
+            'total_bytes': total,
+        }
 
     def _distillation_targets(self):
         seasonal_lookup = {
@@ -387,12 +507,15 @@ class ContinualFedMixer:
                     model = self.clients[representative_index].model
                     device = next(model.parameters()).device
                     inputs = self.public_inputs.to(device)
+                    was_training = model.training
+                    model.eval()
                     if hasattr(model, 'forecast_multiscale'):
                         output = model.forecast_multiscale(inputs)
                         predictions.append(output[0])
                         scale_predictions.append(torch.stack(output[1], dim=1))
                     else:
                         predictions.append(self.forward_fn(model, inputs))
+                    model.train(was_training)
                 prediction = torch.stack(predictions).mean(dim=0).detach()
                 if scale_predictions:
                     scales = torch.stack(scale_predictions).mean(dim=0).detach()

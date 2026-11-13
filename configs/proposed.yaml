@@ -13,5 +13,6 @@ distillation:
   history: true
   representation: true
   mutual: true
+  retention_weighting: true
   history_weight: 0.3
   representation_weight: 0.1

@@ -62,17 +62,21 @@ Only `TimeMixer` is registered in `exp/exp_basic.py`, although the CLI help text
 3. Creates one independently initialized TimeMixer model and optimizer per client.
 4. Wraps each model in `ContinualClient`.
 5. Creates a `ContinualFedMixer` trainer.
-6. By default, runs four methods on the same round data: FedAvg, FedAvg-FCL (FedAvg with
+6. By default, runs four methods on the same round data with five seeds: FedAvg, FedAvg-FCL (FedAvg with
    legacy replay/drift), FedMixer-FCL (clustered FedMixer with legacy replay/drift), and
    the proposed replay-free distribution-memory method. `--mode baseline`, `continual`,
    and `both` select legacy subsets; `--mode all` selects all four.
 7. Evaluates each client after every round on all chronological held-out rounds seen so far.
-8. Reports ACE/BWT for both MSE and MAE, plus diagonal per-round MSE values, in the output log.
-9. Appends metric, runtime, peak CUDA allocation, and accounted memory summaries.
+8. Reports diagonal ACE, RMSE/MAE, error-based forgetting, and sign-corrected BWT.
+9. Saves individual seed results, mean/sample-standard-deviation, failed seeds, wall time,
+   peak CUDA allocation, and accounted persistent memory as JSON.
 
 FedAvg performs sample-weighted global aggregation. The other variants use decoupled
 seasonal/trend aggregation. FedAvg-FCL and FedMixer-FCL retain the legacy raw replay
 implementation; the proposed variant stores only bounded representation summaries.
+The comparison uses identical prebuilt chronological tasks for each method and resets random
+seeds before each run. `--mode ablation` runs the full proposed method and its four component
+ablations.
 
 ### Generic CSV smoke runner
 
@@ -431,30 +435,55 @@ The federated classes are exported by `continual_federated/__init__.py`:
 
 ### Replay-free proposed mode
 
-`ContinualFedMixer(..., method='proposed')` is the replay-free path described in
-`imp.md`. It does not construct `SpectralCoresetMemory`. Each client instead
-owns a bounded `DistributionMemory` containing only diagonal-Gaussian
-representation summaries (`mean`, `log_variance`, sample count, task ID,
-temporal signature, and metadata). The summary is produced in a single frozen
-reference-encoder space copied from the first active participant after local training
-and round aggregation; raw
-windows are discarded after encoding.
+`ContinualFedMixer(..., method='proposed')` is the raw-sample-replay-free path. It does not
+construct or populate `SpectralCoresetMemory`. Each client keeps bounded diagonal-Gaussian
+post-PDM representation summaries: mean, log-variance, represented-sample count, first and
+most recent task IDs, occurrence count, and optional spectral signature. No historical raw
+input or target windows are retained.
 
-The reference encoder is frozen for the remainder of the run. Seasonal and trend drift
-signatures are aggregated across all batches of a client round, and each pathway is
-reclustered only at initialization or when that pathway drifts. Similarity normalized
-top-k weights control the retention term. The PDM representation concatenates post-mixing
-seasonal and trend features while retaining temporal and hidden dimensions.
+The frozen reference encoder is initialized after first-round local optimization from the
+sample-count-weighted average of all active clients' model states, before FedMixer applies
+client-specific pathway averaging. One active model is used only as a compatible architecture
+container. This creates a synchronized representation space when client indices are missing
+or non-consecutive. The encoder is frozen afterward. TimeMixer summaries concatenate
+post-mixing seasonal and trend features while preserving temporal positions and hidden
+features. Channel-independent features are regrouped into one vector per original window.
+TimeMixer requires the configured `seq_len` and `enc_in`; mismatches fail explicitly.
 
-At each later round, the current windows are encoded by that frozen reference
-encoder and compared with the client's stored summaries. The top-k similarity
-controls a bounded retention coefficient. The live model is trained on the
-current batch with forecast loss plus prediction-teacher and representation
-moment losses against the latest previous-task teacher. Teacher evaluation is
-detached, while student representations retain gradients. Mutual targets are
-generated and consumed on the exact same independently generated Fourier
-anchor tensor. The default `legacy` mode continues to instantiate and use raw
-replay for baseline comparison.
+For query `q=(mu_q, logvar_q)` and stored entry `j`, the distance is
+`d_j = MSE(mu_q,mu_j) + beta * MSE(logvar_q,logvar_j)` and similarity is
+`s_j = exp(-d_j / temperature)`. The top-k weights are `w_j=s_j/sum_i(s_i)`. The
+retention coefficient is `r=min_similarity + (1-min_similarity)*sum_j(w_j*s_j)`.
+Recurring near-identical summaries update a stored entry using pooled moments and an
+occurrence count. This is a bounded representative memory, not a guarantee that every
+unique historical regime will survive a capacity limit.
+
+The exact objective is
+`L = L_forecast + lambda_h*r*L_history + lambda_r*r*L_representation + lambda_m*L_mutual`.
+`L_history` is forecast MSE between the student and a frozen per-client snapshot of that
+client's post-aggregation model from the prior round. `L_representation` matches batch
+feature means and log variances between that student and teacher. `L_mutual` separately
+matches the student forecast to current clustered-teacher predictions on the same independent
+Fourier probes. Distribution memory does not add a direct Gaussian matching loss; similarity
+only scales the historical terms. The teacher is updated after distillation/aggregation and is
+omitted when both history/representation switches are off or their weights are zero.
+Retention weighting can independently be disabled with `retention_weighting: false`.
+
+Seasonal spectral and polynomial trend signatures are sample-count-weighted online across
+all batches in each round. Drift is checked against a stable regime anchor so gradual changes
+can accumulate; a detected pathway accepts the new signature as its next anchor. Only that
+pathway is reclustered. Missing clients do not contribute, and a returning client without a
+current partition triggers reclustering.
+
+The code does not directly distribution-match the current and historical Gaussians. The
+memory similarity only modulates teacher losses. Orthogonal gradient projection is not used
+in proposed mode; it remains in the legacy client update path. The legacy mode continues to
+retain raw replay for baseline comparison.
+
+Per client, K summaries of width D use `O(KD)` storage. Algorithmic memory also includes
+the reference/teacher model copies, drift signatures, and legacy replay/projector state when
+enabled. Reported accounting separates algorithmic state, client model weights, optimizer
+state, and CUDA peak allocation; it excludes Python-object overhead and CPU peak RSS.
 
 ### data_fcl seasonal integration
 
@@ -611,13 +640,19 @@ forming an error matrix `E[client, trained_round, evaluated_round]`. The reporte
 are:
 
 - `ACE_MSE`: the mean of the diagonal entries, measuring error on each newly learned regime.
-- `BWT`: the final-round historical error minus the corresponding earlier diagonal error,
-  averaged over clients and all non-final rounds. Positive values indicate forgetting.
+- `forgetting`: final-round historical error minus error immediately after learning that
+  task. Positive values indicate forgetting because these are error metrics.
+- `BWT`: the negative of error-based forgetting, so positive values indicate reduced error
+  on earlier tasks.
 
-The comparison output reports `ACE_MSE`, `ACE_MAE`, `BWT_MSE`, `BWT_MAE`, and diagonal
-`round_MSE` values instead of final-round training-batch metrics. The standard
-`make_rounds()` return remains backward-compatible for callers that do not request
-evaluation splits.
+The comparison reports ACE MAE/RMSE/MSE, forgetting and BWT, runtime, and persistent memory
+for each seed, then reports mean and sample standard deviation across successful runs. It
+also saves failed seeds rather than removing them. The standard `make_rounds()` return
+remains backward-compatible for callers that do not request evaluation splits.
+
+`scripts/synthetic_fcl_experiment.py` separately validates the mechanism on controlled
+stable, gradual, abrupt, recurring, heterogeneous-client, and missing-client tasks. Those
+synthetic results do not establish real-world forecasting performance.
 
 ## 7. Continual Flags in Standard Training
 
@@ -753,9 +788,11 @@ The scripts under `scripts/short_term_forecast/` cover M4 and PEMS experiments.
 
 `scripts/download_electricity_federated.py` prepares household clients and continual round metadata.
 
-`scripts/compare_fedmixer.py` runs the federated baseline and continual comparison.
+`scripts/compare_fedmixer.py` runs the four-way, multi-seed comparison and proposed ablation.
 
 `scripts/run_continual_csv.py` runs a small generic CSV continual path.
+
+`scripts/synthetic_fcl_experiment.py` runs the controlled synthetic mechanism validation.
 
 ## 14. Known Limitations and Important Caveats
 
@@ -780,7 +817,13 @@ These are concrete properties of the current code, not proposed fixes:
 17. Several base-class methods are intentionally abstract stubs and should not be called directly.
 18. CLI validation is limited, so missing files, columns, incompatible channels, invalid task/dataset combinations, and insufficient windows generally fail at runtime.
 19. The shell scripts assume Unix command syntax, relative paths, and an available CUDA/PyTorch environment.
-20. The repository does not include automated unit tests; the tiny demo and smoke runners are the available executable checks for the continual components.
+20. `scripts/compare_fedmixer.py` requires prepared Electricity client CSVs; no real-world
+    performance claim follows from the synthetic runner or unit tests alone.
+21. A fixed memory capacity cannot guarantee retention of every unique regime. The bounded
+    eviction policy merges recurring near-identical summaries, then evicts the most redundant
+    candidate and prefers frequently observed/older representatives.
+22. The proposed path does not use orthogonal gradient projection, cluster adapters, soft
+    memberships, or compatibility-aware cross-cluster transfer.
 
 ## 15. End-to-End Mental Model
 

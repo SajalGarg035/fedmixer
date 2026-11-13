@@ -85,7 +85,10 @@ class MultiscaleSpectralTrendDetector:
             basis.append(positions ** degree)
         basis = torch.stack(basis, dim=1)
         coefficients = torch.einsum('btc,tp->bpc', trend, basis)
-        return coefficients.mean(dim=(0, 1))
+        # Keep polynomial degree and channel identity. Averaging those axes
+        # collapses univariate trend signatures to one scalar and misses most
+        # changes in slope, curvature, and level.
+        return coefficients.mean(dim=0).flatten()
 
     @staticmethod
     def _wasserstein(first, second):
@@ -115,15 +118,25 @@ class MultiscaleSpectralTrendDetector:
         trend_signature = torch.as_tensor(trend_signature).float().cpu()
         seasonal_distance = 0.0
         trend_distance = 0.0
+        seasonal_drift = False
+        trend_drift = False
         if self.previous_seasonal is not None:
             seasonal_distance = self._wasserstein(
                 seasonal_signature, self.previous_seasonal).item()
-            trend_distance = torch.nn.functional.cosine_similarity(
-                trend_signature, self.previous_trend, dim=0).neg().add(1).item()
-        seasonal_drift = seasonal_distance > self.seasonal_threshold
-        trend_drift = trend_distance > self.trend_threshold
-        self.previous_seasonal = seasonal_signature
-        self.previous_trend = trend_signature
+            seasonal_drift = seasonal_distance > self.seasonal_threshold
+            trend_delta = torch.linalg.vector_norm(
+                trend_signature - self.previous_trend)
+            trend_scale = (torch.linalg.vector_norm(trend_signature) +
+                           torch.linalg.vector_norm(self.previous_trend) + 1e-8)
+            trend_distance = (trend_delta / trend_scale).item()
+            trend_drift = trend_distance > self.trend_threshold
+        # Keep a stable-regime anchor until a change crosses its threshold.
+        # This lets small gradual shifts accumulate instead of chasing each
+        # immediately preceding round. On detection, accept the new regime.
+        if self.previous_seasonal is None or seasonal_drift:
+            self.previous_seasonal = seasonal_signature.clone()
+        if self.previous_trend is None or trend_drift:
+            self.previous_trend = trend_signature.clone()
         return (seasonal_drift, trend_drift, seasonal_signature,
                 trend_signature, seasonal_distance, trend_distance)
 
@@ -133,3 +146,9 @@ class MultiscaleSpectralTrendDetector:
     def reset(self):
         self.previous_seasonal = None
         self.previous_trend = None
+
+    @property
+    def byte_count(self):
+        return sum(value.numel() * value.element_size()
+                   for value in (self.previous_seasonal, self.previous_trend)
+                   if torch.is_tensor(value))

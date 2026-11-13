@@ -109,6 +109,7 @@ def main():
         history_enabled=config['distillation'].get('history', True),
         representation_enabled=config['distillation'].get('representation', True),
         mutual_enabled=config['distillation'].get('mutual', True),
+        retention_enabled=config['distillation'].get('retention_weighting', True),
         strategy=config.get('strategy', 'fedmixer'),
         distribution_memory_kwargs=memory_config)
     results = []

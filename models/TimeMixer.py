@@ -336,6 +336,17 @@ class Model(nn.Module):
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec,
                 return_multiscale=False):
 
+        if x_enc.ndim != 3:
+            raise ValueError('x_enc must have [batch, time, channels] shape')
+        if x_enc.shape[1] != self.seq_len:
+            raise ValueError(
+                'TimeMixer expects seq_len={}, received {}'.format(
+                    self.seq_len, x_enc.shape[1]))
+        if x_enc.shape[2] != self.configs.enc_in:
+            raise ValueError(
+                'TimeMixer expects enc_in={}, received {}'.format(
+                    self.configs.enc_in, x_enc.shape[2]))
+
         if self.use_future_temporal_feature:
             if self.channel_independence == 1:
                 B, T, N = x_enc.size()
@@ -423,7 +434,9 @@ class Model(nn.Module):
     def encode(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None):
         """Return a fixed-width, batch-first representation of the backbone."""
         output = self.forecast_multiscale(x_enc, x_mark_enc, x_dec, x_mark_dec)
-        return self._representation_from_components(output[2], output[3], output[0])
+        representation = self._representation_from_components(
+            output[2], output[3], output[0])
+        return self._restore_input_batch(representation, x_enc)
 
     def forward_with_representation(self, x_enc, x_mark_enc=None, x_dec=None,
                                     x_mark_dec=None):
@@ -431,7 +444,26 @@ class Model(nn.Module):
         output = self.forecast_multiscale(x_enc, x_mark_enc, x_dec, x_mark_dec)
         representation = self._representation_from_components(
             output[2], output[3], output[0])
+        representation = self._restore_input_batch(representation, x_enc)
         return output[0], representation
+
+    def _restore_input_batch(self, representation, x_enc):
+        """Combine channel-independent embeddings into one vector per window."""
+        batch_size, _, channels = x_enc.shape
+        if self.channel_independence == 1 and channels > 1:
+            expected = batch_size * channels
+            if representation.shape[0] != expected:
+                raise ValueError(
+                    'channel-independent representation batch mismatch: '
+                    'expected {}, received {}'.format(
+                        expected, representation.shape[0]))
+            representation = representation.reshape(batch_size, channels, -1)
+            representation = representation.flatten(start_dim=1)
+        elif representation.shape[0] != batch_size:
+            raise ValueError(
+                'representation batch mismatch: expected {}, received {}'.format(
+                    batch_size, representation.shape[0]))
+        return representation
 
     def future_multi_mixing(self, B, enc_out_list, x_list):
         dec_out_list = []
