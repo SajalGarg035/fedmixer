@@ -71,6 +71,10 @@ class DistributionMemory:
         self._evict_if_needed()
 
     def similarity(self, query_summary, stored_summary):
+        if (query_summary['mean'].shape != stored_summary['mean'].shape or
+                query_summary['log_variance'].shape !=
+                stored_summary['log_variance'].shape):
+            raise ValueError('query and stored representation dimensions differ')
         mean_distance = (query_summary['mean'].float() -
                          stored_summary['mean'].float()).pow(2).mean()
         variance_distance = (query_summary['log_variance'].float() -
@@ -82,14 +86,19 @@ class DistributionMemory:
     def retrieve(self, query_summary, top_k=None):
         if not self.entries:
             return []
-        count = min(top_k or len(self.entries), len(self.entries))
+        if top_k is not None and top_k < 1:
+            raise ValueError('top_k must be positive')
+        count = min(len(self.entries) if top_k is None else top_k,
+                    len(self.entries))
         ranked = sorted(
             ((self.similarity(query_summary, entry), entry)
              for entry in self.entries),
             key=lambda item: item[0], reverse=True)
         selected = ranked[:count]
         scores = torch.tensor([score for score, _ in selected], dtype=torch.float32)
-        weights = scores / scores.sum().clamp_min(self.epsilon)
+        score_sum = scores.sum()
+        weights = (scores / score_sum if score_sum > self.epsilon else
+                   torch.full_like(scores, 1.0 / len(selected)))
         return [
             {'entry': entry, 'similarity': float(score), 'weight': float(weight)}
             for (score, entry), weight in zip(selected, weights)
@@ -98,8 +107,13 @@ class DistributionMemory:
     def retention_weight(self, retrieved):
         if not retrieved:
             return self.min_similarity
-        return self.min_similarity + (1 - self.min_similarity) * max(
-            item['similarity'] for item in retrieved)
+        weight_sum = sum(float(item['weight']) for item in retrieved)
+        if weight_sum <= self.epsilon:
+            return self.min_similarity
+        weighted_similarity = sum(
+            float(item['weight']) * float(item['similarity'])
+            for item in retrieved) / weight_sum
+        return self.min_similarity + (1 - self.min_similarity) * weighted_similarity
 
     @property
     def byte_count(self):

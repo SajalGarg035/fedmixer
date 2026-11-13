@@ -62,15 +62,17 @@ Only `TimeMixer` is registered in `exp/exp_basic.py`, although the CLI help text
 3. Creates one independently initialized TimeMixer model and optimizer per client.
 4. Wraps each model in `ContinualClient`.
 5. Creates a `ContinualFedMixer` trainer.
-6. Runs either:
-  - baseline mode: decoupled aggregation and synthetic-probe distillation, without replay or drift updates;
-  - continual mode: decoupled aggregation, synthetic-probe distillation, replay, drift detection, and gradient projection;
-  - both: runs both variants using the same round data.
+6. By default, runs four methods on the same round data: FedAvg, FedAvg-FCL (FedAvg with
+   legacy replay/drift), FedMixer-FCL (clustered FedMixer with legacy replay/drift), and
+   the proposed replay-free distribution-memory method. `--mode baseline`, `continual`,
+   and `both` select legacy subsets; `--mode all` selects all four.
 7. Evaluates each client after every round on all chronological held-out rounds seen so far.
 8. Reports ACE/BWT for both MSE and MAE, plus diagonal per-round MSE values, in the output log.
-9. Appends a short summary to the requested output log.
+9. Appends metric, runtime, peak CUDA allocation, and accounted memory summaries.
 
-The baseline is therefore not plain local training. It still uses the shared server aggregation and prediction-space distillation; it only passes `continual=False` to the trainer.
+FedAvg performs sample-weighted global aggregation. The other variants use decoupled
+seasonal/trend aggregation. FedAvg-FCL and FedMixer-FCL retain the legacy raw replay
+implementation; the proposed variant stores only bounded representation summaries.
 
 ### Generic CSV smoke runner
 
@@ -434,8 +436,15 @@ The federated classes are exported by `continual_federated/__init__.py`:
 owns a bounded `DistributionMemory` containing only diagonal-Gaussian
 representation summaries (`mean`, `log_variance`, sample count, task ID,
 temporal signature, and metadata). The summary is produced in a single frozen
-reference-encoder space initialized after the first aggregated round; raw
+reference-encoder space copied from the first active participant after local training
+and round aggregation; raw
 windows are discarded after encoding.
+
+The reference encoder is frozen for the remainder of the run. Seasonal and trend drift
+signatures are aggregated across all batches of a client round, and each pathway is
+reclustered only at initialization or when that pathway drifts. Similarity normalized
+top-k weights control the retention term. The PDM representation concatenates post-mixing
+seasonal and trend features while retaining temporal and hidden dimensions.
 
 At each later round, the current windows are encoded by that frozen reference
 encoder and compared with the client's stored summaries. The top-k similarity

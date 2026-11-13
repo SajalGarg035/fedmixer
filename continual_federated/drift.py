@@ -94,7 +94,7 @@ class MultiscaleSpectralTrendDetector:
         second = torch.nn.functional.pad(second, (0, length - second.numel()))
         return torch.cumsum(first, dim=0).sub(torch.cumsum(second, dim=0)).abs().mean()
 
-    def update(self, current_chunk):
+    def signatures(self, current_chunk):
         values = current_chunk.detach().float()
         if values.ndim == 2:
             values = values.unsqueeze(-1)
@@ -108,6 +108,11 @@ class MultiscaleSpectralTrendDetector:
             trend_signatures.append(self._trend_signature(trend))
         seasonal_signature = torch.cat(seasonal_signatures).cpu()
         trend_signature = torch.cat(trend_signatures).cpu()
+        return seasonal_signature, trend_signature
+
+    def update_signatures(self, seasonal_signature, trend_signature):
+        seasonal_signature = torch.as_tensor(seasonal_signature).float().cpu()
+        trend_signature = torch.as_tensor(trend_signature).float().cpu()
         seasonal_distance = 0.0
         trend_distance = 0.0
         if self.previous_seasonal is not None:
@@ -119,7 +124,11 @@ class MultiscaleSpectralTrendDetector:
         trend_drift = trend_distance > self.trend_threshold
         self.previous_seasonal = seasonal_signature
         self.previous_trend = trend_signature
-        return seasonal_drift, trend_drift, seasonal_signature, trend_signature
+        return (seasonal_drift, trend_drift, seasonal_signature,
+                trend_signature, seasonal_distance, trend_distance)
+
+    def update(self, current_chunk):
+        return self.update_signatures(*self.signatures(current_chunk))[:4]
 
     def reset(self):
         self.previous_seasonal = None

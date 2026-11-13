@@ -251,9 +251,11 @@ python scripts/compare_fedmixer.py \
   --output ./output/output.log
 ```
 
-The baseline keeps clustered averaging and mutual distillation but disables replay memory
-and drift detection. The continual variant enables both. The selected results are printed to
-the terminal and written to `output/output.log`; the output directory is created automatically.
+The comparison runner defaults to `--mode all` and compares FedAvg, FedAvg-FCL,
+FedMixer-FCL, and the replay-free distribution-memory method. `--mode baseline`,
+`--mode continual`, or `--mode both` select the corresponding legacy subsets. Results
+include ACE/BWT, per-round error, wall time, peak CUDA allocation when applicable, and
+accounted tensor storage for replay/distribution memory, the reference encoder, and teachers.
 
 The comparison commands above use the full prepared timeline. To prepare the complete
 Electricity archive and all clients first:
@@ -277,12 +279,13 @@ python scripts/compare_fedmixer.py \
   --rounds 4 \
   --limit 0 \
   --device cuda \
-  --mode both \
+  --mode all \
   --output ./output/full_output.log
 ```
 
-Use `--mode baseline` or `--mode continual` instead of `both` for one variant. Full mode
-uses every complete sliding window in each temporal task, batched in groups of 32.
+Use `--mode baseline` or `--mode continual` to run one legacy variant, or `--mode both`
+for the two FedMixer legacy variants. The default `all` mode compares all four methods.
+Full mode uses every complete sliding window in each temporal task, batched in groups of 32.
 
 ### Standard single-client training
 
@@ -321,10 +324,8 @@ python run.py \
   --drift_threshold 1.0
 ```
 
-The actual FedMixer baseline and continual comparison commands are the three commands above:
-use `--mode baseline` for FedMixer only, `--mode continual` for FedMixer plus continual
-learning, or `--mode both` to run and display both. Results are appended to
-`output/output.log`.
+The comparison runner reports FedAvg, FedAvg-FCL, FedMixer-FCL, and proposed distribution
+memory when run with its default `--mode all`. Results are appended to `output/output.log`.
 
 For the original benchmark experiments, use the supplied scripts:
 

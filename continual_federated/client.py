@@ -37,10 +37,39 @@ class ContinualClient:
         self.last_drift = (False, False)
         self.last_seasonal_drift = False
         self.last_trend_drift = False
+        self._round_signatures = []
+        self.last_drift_distances = (0.0, 0.0)
 
     def begin_round(self):
         self.last_seasonal_drift = False
         self.last_trend_drift = False
+        self.last_drift = (False, False)
+        self.last_signatures = (None, None)
+        self._round_signatures = []
+
+    def accumulate_drift(self, inputs):
+        seasonal, trend = self.drift_detector.signatures(inputs)
+        count = int(inputs.shape[0])
+        self._round_signatures.append((seasonal, trend, count))
+
+    def finalize_round_drift(self):
+        if not self._round_signatures:
+            self.last_signatures = (None, None)
+            self.last_drift = (False, False)
+            return self.last_drift
+        total = sum(count for _, _, count in self._round_signatures)
+        seasonal = sum(value * count for value, _, count in self._round_signatures) / total
+        trend = sum(value * count for _, value, count in self._round_signatures) / total
+        (seasonal_drift, trend_drift, seasonal, trend,
+         seasonal_distance, trend_distance) = self.drift_detector.update_signatures(
+            seasonal, trend)
+        self.last_drift = (seasonal_drift, trend_drift)
+        self.last_seasonal_drift = seasonal_drift
+        self.last_trend_drift = trend_drift
+        self.last_signatures = (seasonal, trend)
+        self.last_drift_distance = float(max(seasonal_distance, trend_distance))
+        self.last_drift_distances = (float(seasonal_distance), float(trend_distance))
+        return self.last_drift
 
     def observe(self, inputs):
         seasonal, trend, seasonal_signature, trend_signature = self.drift_detector.update(inputs)
@@ -75,7 +104,10 @@ class ContinualClient:
                                 retention_weight=0.0, history_weight=0.3,
                                 representation_weight=0.1,
                                 distillation_inputs=None,
-                                distillation_targets=None):
+                                distillation_targets=None,
+                                history_enabled=True,
+                                representation_enabled=True,
+                                mutual_enabled=True):
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         self.model.train()
@@ -85,17 +117,22 @@ class ContinualClient:
         forecast_loss = F.mse_loss(predictions, targets)
         history_loss = forecast_loss.new_zeros(())
         representation_loss = forecast_loss.new_zeros(())
-        if self.previous_teacher is not None:
+        if self.previous_teacher is not None and (history_enabled or representation_enabled):
             with torch.no_grad():
                 teacher_predictions, teacher_representation = self._representation(
                     self.previous_teacher, inputs, forward_fn)
-            history_loss = F.mse_loss(predictions, teacher_predictions.detach())
-            representation_loss = self._moment_loss(
-                representation, teacher_representation.detach())
-        loss = (forecast_loss + history_weight * retention_weight * history_loss
-                + representation_weight * retention_weight * representation_loss)
+            if history_enabled:
+                history_loss = F.mse_loss(predictions, teacher_predictions.detach())
+            if representation_enabled:
+                representation_loss = self._moment_loss(
+                    representation, teacher_representation.detach())
+        weighted_history = history_weight * retention_weight * history_loss
+        weighted_representation = (representation_weight * retention_weight
+                                   * representation_loss)
+        loss = forecast_loss + weighted_history + weighted_representation
         mutual_loss = forecast_loss.new_zeros(())
-        if distillation_inputs is not None and distillation_targets is not None:
+        if (mutual_enabled and distillation_inputs is not None
+                and distillation_targets is not None):
             anchor_predictions, _ = self._representation(
                 self.model, distillation_inputs.to(self.device), forward_fn)
             if isinstance(distillation_targets, tuple):
@@ -111,6 +148,9 @@ class ContinualClient:
             'history': history_loss.detach().item(),
             'representation': representation_loss.detach().item(),
             'mutual': mutual_loss.detach().item(),
+            'weighted_history': weighted_history.detach().item(),
+            'weighted_representation': weighted_representation.detach().item(),
+            'weighted_mutual': (self.distill_weight * mutual_loss).detach().item(),
         }
 
     @staticmethod
@@ -125,7 +165,8 @@ class ContinualClient:
         return mean_loss + 0.5 * F.mse_loss(student_log_var, teacher_log_var)
 
     def train_batch(self, inputs, targets, forward_fn, distillation_inputs=None,
-                    distillation_targets=None, use_replay=True):
+                    distillation_targets=None, use_replay=True,
+                    mutual_enabled=True):
         inputs = inputs.to(self.device)
         targets = targets.to(self.device)
         self.model.train()
@@ -149,7 +190,8 @@ class ContinualClient:
                     current_output = replay_scales if replay_scales is not None else replay_predictions
                     loss = loss + self.memory_weight * F.mse_loss(current_output, old_predictions)
 
-        if distillation_inputs is not None and distillation_targets is not None:
+        if (mutual_enabled and distillation_inputs is not None
+                and distillation_targets is not None):
             distill_predictions, distill_scales = self.forward_with_scales(
                 distillation_inputs.to(self.device), forward_fn)
             target_predictions = distillation_targets

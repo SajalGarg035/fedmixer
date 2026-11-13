@@ -12,10 +12,22 @@ def load_config(path):
 
 
 def validate_config(config):
+    if not isinstance(config, dict):
+        raise ValueError('configuration must be a mapping')
     method = config.get('method', 'legacy')
     if method not in ('legacy', 'proposed'):
         raise ValueError('method must be legacy or proposed')
+    strategy = config.setdefault('strategy', 'fedmixer')
+    if strategy not in ('fedavg', 'fedmixer'):
+        raise ValueError('strategy must be fedavg or fedmixer')
     memory = config.setdefault('distribution_memory', {})
+    distillation = config.setdefault('distillation', {})
+    for key in ('history', 'representation', 'mutual'):
+        distillation.setdefault(key, True)
+    for key in ('history_weight', 'representation_weight'):
+        value = float(distillation.get(key, 0.0))
+        if value < 0:
+            raise ValueError('{} must be non-negative'.format(key))
     if method == 'proposed':
         if config.get('replay', False):
             raise ValueError('proposed mode must disable replay')
@@ -28,4 +40,6 @@ def validate_config(config):
             raise ValueError('distribution temperature must be positive')
         if not 0 <= float(memory.get('min_similarity', 0.1)) <= 1:
             raise ValueError('min_similarity must be in [0, 1]')
+        if float(memory.get('variance_weight', 0.5)) < 0:
+            raise ValueError('variance_weight must be non-negative')
     return config

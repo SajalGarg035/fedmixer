@@ -1,4 +1,5 @@
 method: proposed
+strategy: fedmixer
 replay: false
 distribution_memory:
   enabled: true

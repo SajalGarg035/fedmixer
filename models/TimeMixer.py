@@ -181,7 +181,10 @@ class PastDecomposableMixing(nn.Module):
                 out = ori + self.out_cross_layer(out)
             out_list.append(out[:, :length, :])
         if return_components:
-            return out_list, season_list, trend_list
+            # Return the outputs of the two PDM mixing paths in [B, T, D]
+            # layout.  These are the learned, post-mixing features consumed by
+            # the predictor, rather than the pre-mixing decompositions.
+            return out_list, out_season_list, out_trend_list
         return out_list
 
 
@@ -408,10 +411,14 @@ class Model(nn.Module):
         for component_group in (seasonal_components, trend_components):
             for layer_components in component_group:
                 for component in layer_components:
-                    components.append(component.float().mean(dim=(1, 2)))
+                    if component.ndim != 3:
+                        raise ValueError('PDM components must have [batch, time, hidden] shape')
+                    # Preserve both hidden features and temporal positions while
+                    # using a fixed width for a fixed model/input configuration.
+                    components.append(component.float().flatten(start_dim=1))
         if not components:
-            return fallback.float().reshape(fallback.shape[0], -1).mean(dim=1, keepdim=True)
-        return torch.stack(components, dim=1)
+            return fallback.float().reshape(fallback.shape[0], -1)
+        return torch.cat(components, dim=1)
 
     def encode(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None):
         """Return a fixed-width, batch-first representation of the backbone."""

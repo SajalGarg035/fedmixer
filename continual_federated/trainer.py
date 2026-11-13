@@ -18,7 +18,9 @@ class ContinualFedMixer:
     def __init__(self, clients, forward_fn, public_inputs=None, server=None,
                  method='legacy', distribution_memory_kwargs=None,
                  history_weight=0.3, representation_weight=0.1,
-                 generate_public_anchors=True):
+                 generate_public_anchors=True, history_enabled=True,
+                 representation_enabled=True, mutual_enabled=True,
+                 strategy='fedmixer'):
         if not clients:
             raise ValueError('clients must not be empty')
         self.clients = clients
@@ -31,6 +33,12 @@ class ContinualFedMixer:
         self.method = method
         self.history_weight = history_weight
         self.representation_weight = representation_weight
+        self.history_enabled = bool(history_enabled)
+        self.representation_enabled = bool(representation_enabled)
+        self.mutual_enabled = bool(mutual_enabled)
+        if strategy not in ('fedavg', 'fedmixer'):
+            raise ValueError("strategy must be 'fedavg' or 'fedmixer'")
+        self.strategy = strategy
         self.reference_encoder = None
         memory_kwargs = dict(distribution_memory_kwargs or {})
         self.distribution_top_k = int(memory_kwargs.pop('top_k', 3))
@@ -79,20 +87,29 @@ class ContinualFedMixer:
             trend_signatures = []
             seasonal_drift = []
             trend_drift = []
+            retrievals = []
             for client_index in active_indices:
                 client = self.clients[client_index]
                 batches = client_batches[client_index]
                 client.begin_round()
+                if continual:
+                    for inputs, _ in batches:
+                        client.accumulate_drift(inputs)
+                    client.finalize_round_drift()
                 client_loss = []
                 component_totals = {
                     'forecast': 0.0, 'history': 0.0, 'representation': 0.0,
-                    'mutual': 0.0, 'total': 0.0}
+                    'mutual': 0.0, 'weighted_history': 0.0,
+                    'weighted_representation': 0.0, 'weighted_mutual': 0.0,
+                    'total': 0.0}
                 sample_count = 0
                 client_drift = False
-                retention_weight = self._retention_weight(client_index, batches)
+                retention_weight, retrieval = self._retention_weight(client_index, batches)
+                retrievals.append({'client_id': client_index,
+                                   'retention_weight': retention_weight,
+                                   'tasks': retrieval})
                 for inputs, targets in batches:
-                    if continual:
-                        client_drift = client.observe(inputs) or client_drift
+                    client_drift = any(client.last_drift)
                     if self.method == 'proposed':
                         components = client.train_batch_replay_free(
                             inputs, targets, self.forward_fn,
@@ -100,7 +117,10 @@ class ContinualFedMixer:
                             history_weight=self.history_weight,
                             representation_weight=self.representation_weight,
                             distillation_inputs=self.public_inputs,
-                            distillation_targets=public_targets[client_index])
+                            distillation_targets=public_targets[client_index],
+                            history_enabled=self.history_enabled,
+                            representation_enabled=self.representation_enabled,
+                            mutual_enabled=self.mutual_enabled)
                         client_loss.append(components['total'])
                         for name in component_totals:
                             component_totals[name] += components[name]
@@ -108,7 +128,8 @@ class ContinualFedMixer:
                         client_loss.append(client.train_batch(
                             inputs, targets, self.forward_fn,
                             self.public_inputs, public_targets[client_index],
-                            use_replay=continual))
+                            use_replay=continual,
+                            mutual_enabled=self.mutual_enabled))
                     sample_count += len(inputs)
                 seasonal_signature, trend_signature = client.last_signatures
                 seasonal_signatures.append(
@@ -128,26 +149,56 @@ class ContinualFedMixer:
             states = [{name: value.detach().clone()
                        for name, value in self.clients[index].model.state_dict().items()}
                       for index in active_indices]
-            seasonal_recluster = True
-            trend_recluster = True
-            self.server.recluster_pathways(
-                seasonal_signatures, trend_signatures,
-                seasonal=seasonal_recluster, trend=trend_recluster)
-            cluster_states = self.server.aggregate_decoupled(
-                states, seasonal_signatures, trend_signatures, sample_counts,
-                force_recluster=False)
+            if self.strategy == 'fedavg':
+                average = self.server.average_cluster(
+                    states, list(range(len(states))), sample_counts)
+                cluster_states = [average for _ in states]
+                self.server.seasonal_clusters = [list(active_indices)]
+                self.server.trend_clusters = [list(active_indices)]
+                self.server.clusters = self.server.seasonal_clusters
+                reclustered = {'seasonal': False, 'trend': False}
+            else:
+                if self.method == 'legacy':
+                    # Keep the legacy baseline's original reclustering cadence.
+                    seasonal_recluster = trend_recluster = True
+                else:
+                    seasonal_recluster = (
+                        self.server.seasonal_clusters is None or
+                        not self._partition_covers(
+                            self.server.seasonal_clusters, active_indices) or
+                        any(client.last_seasonal_drift
+                            for client in (self.clients[index] for index in active_indices)))
+                    trend_recluster = (
+                        self.server.trend_clusters is None or
+                        not self._partition_covers(
+                            self.server.trend_clusters, active_indices) or
+                        any(client.last_trend_drift
+                            for client in (self.clients[index] for index in active_indices)))
+                reclustered = {'seasonal': seasonal_recluster,
+                               'trend': trend_recluster}
+                # Keep old partitions in global client IDs between drift events,
+                # then map them to this round's compact active-client indices.
+                if not seasonal_recluster:
+                    self.server.seasonal_clusters = self._active_partition(
+                        self.server.seasonal_clusters, active_indices)
+                if not trend_recluster:
+                    self.server.trend_clusters = self._active_partition(
+                        self.server.trend_clusters, active_indices)
+                self.server.recluster_pathways(
+                    seasonal_signatures, trend_signatures,
+                    seasonal=seasonal_recluster, trend=trend_recluster)
+                cluster_states = self.server.aggregate_decoupled(
+                    states, seasonal_signatures, trend_signatures, sample_counts,
+                    force_recluster=False)
+                self.server.seasonal_clusters = [
+                    [active_indices[index] for index in indices]
+                    for indices in self.server.seasonal_clusters]
+                self.server.trend_clusters = [
+                    [active_indices[index] for index in indices]
+                    for indices in self.server.trend_clusters]
+                self.server.clusters = self.server.seasonal_clusters
             for local_index, state in enumerate(cluster_states):
                 self.clients[active_indices[local_index]].model.load_state_dict(state)
-
-            seasonal_clusters = [
-                [active_indices[index] for index in indices]
-                for indices in self.server.seasonal_clusters]
-            trend_clusters = [
-                [active_indices[index] for index in indices]
-                for indices in self.server.trend_clusters]
-            self.server.seasonal_clusters = seasonal_clusters
-            self.server.trend_clusters = trend_clusters
-            self.server.clusters = seasonal_clusters
 
             if self.method == 'proposed':
                 self._record_distribution_summaries(
@@ -173,6 +224,12 @@ class ContinualFedMixer:
                 'distribution_bytes': [
                     memory.byte_count for memory in self.distribution_memories],
                 'loss_components': loss_components,
+                'retrievals': retrievals,
+                'reclustered': reclustered,
+                'reference_encoder_bytes': self._module_bytes(self.reference_encoder),
+                'teacher_bytes': sum(self._module_bytes(client.previous_teacher)
+                                     for client in self.clients),
+                'memory_bytes': self._memory_accounting(),
             })
         return history
 
@@ -194,16 +251,21 @@ class ContinualFedMixer:
 
     def _retention_weight(self, client_index, batches):
         if self.method != 'proposed' or self.reference_encoder is None:
-            return 0.0 if self.method == 'proposed' else 1.0
+            return (0.0 if self.method == 'proposed' else 1.0), []
         summary = self._current_summary(batches)
         retrieved = self.distribution_memories[client_index].retrieve(
             summary, top_k=self.distribution_top_k)
-        return self.distribution_memories[client_index].retention_weight(retrieved)
+        return self.distribution_memories[client_index].retention_weight(retrieved), [
+            {'task_id': item['entry']['task_id'],
+             'similarity': item['similarity'], 'weight': item['weight']}
+            for item in retrieved]
 
     def _record_distribution_summaries(self, client_batches, signatures, round_index,
                                        active_indices):
         if self.reference_encoder is None:
-            self.reference_encoder = deepcopy(self.clients[0].model)
+            # Capture only after local training and federated aggregation.  The
+            # first active participant is guaranteed to have contributed.
+            self.reference_encoder = deepcopy(self.clients[active_indices[0]].model)
             self.reference_encoder.eval()
             for parameter in self.reference_encoder.parameters():
                 parameter.requires_grad_(False)
@@ -219,16 +281,37 @@ class ContinualFedMixer:
 
     def state_dict(self):
         return {
+            'schema_version': 2,
             'method': self.method,
+            'strategy': self.strategy,
             'reference_encoder': None if self.reference_encoder is None else
                 self.reference_encoder.state_dict(),
             'distribution_memories': [
                 memory.state_dict() for memory in self.distribution_memories],
+            'teachers': [None if client.previous_teacher is None else
+                         client.previous_teacher.state_dict()
+                         for client in self.clients],
+            'server': {
+                'seasonal_clusters': deepcopy(self.server.seasonal_clusters),
+                'trend_clusters': deepcopy(self.server.trend_clusters),
+            },
         }
 
     def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            raise ValueError('trainer checkpoint must be a dictionary')
+        schema_version = state.get('schema_version', 1)
+        if schema_version not in (1, 2):
+            raise ValueError('unsupported trainer checkpoint schema version')
         if state.get('method') != self.method:
             raise ValueError('trainer checkpoint method does not match')
+        if schema_version >= 2 and state.get('strategy') != self.strategy:
+            raise ValueError('trainer checkpoint strategy does not match')
+        saved_memories = state.get('distribution_memories', [])
+        if len(saved_memories) != len(self.distribution_memories):
+            raise ValueError('trainer checkpoint client memory count does not match')
+        if 'teachers' in state and len(state['teachers']) != len(self.clients):
+            raise ValueError('trainer checkpoint teacher count does not match')
         reference_state = state.get('reference_encoder')
         if reference_state is not None:
             if self.reference_encoder is None:
@@ -237,9 +320,51 @@ class ContinualFedMixer:
             self.reference_encoder.eval()
             for parameter in self.reference_encoder.parameters():
                 parameter.requires_grad_(False)
-        for memory, memory_state in zip(
-                self.distribution_memories, state.get('distribution_memories', [])):
+        for memory, memory_state in zip(self.distribution_memories, saved_memories):
             memory.load_state_dict(memory_state)
+        for client, teacher_state in zip(self.clients, state.get('teachers', [])):
+            if teacher_state is not None:
+                client.previous_teacher = deepcopy(client.model)
+                client.previous_teacher.load_state_dict(teacher_state)
+                client.previous_teacher.eval()
+                for parameter in client.previous_teacher.parameters():
+                    parameter.requires_grad_(False)
+        server_state = state.get('server', {})
+        self.server.seasonal_clusters = deepcopy(server_state.get('seasonal_clusters'))
+        self.server.trend_clusters = deepcopy(server_state.get('trend_clusters'))
+        self.server.clusters = self.server.seasonal_clusters
+
+    @staticmethod
+    def _active_partition(partition, active_indices):
+        mapping = {client_id: local_id
+                   for local_id, client_id in enumerate(active_indices)}
+        result = [[mapping[client_id] for client_id in group if client_id in mapping]
+                  for group in partition]
+        return [group for group in result if group]
+
+    @staticmethod
+    def _partition_covers(partition, client_indices):
+        members = {client_id for group in partition for client_id in group}
+        return set(client_indices).issubset(members)
+
+    @staticmethod
+    def _module_bytes(module):
+        if module is None:
+            return 0
+        return sum(tensor.numel() * tensor.element_size()
+                   for tensor in module.state_dict().values()
+                   if torch.is_tensor(tensor))
+
+    def _memory_accounting(self):
+        replay = sum(client.memory.byte_count if client.memory is not None else 0
+                     for client in self.clients)
+        distribution = sum(memory.byte_count for memory in self.distribution_memories)
+        reference = self._module_bytes(self.reference_encoder)
+        teachers = sum(self._module_bytes(client.previous_teacher)
+                       for client in self.clients)
+        return {'replay_bytes': replay, 'distribution_bytes': distribution,
+                'reference_encoder_bytes': reference, 'teacher_bytes': teachers,
+                'total_bytes': replay + distribution + reference + teachers}
 
     def _distillation_targets(self):
         seasonal_lookup = {

@@ -13,6 +13,12 @@ class SpectralCoresetMemory:
     def __len__(self):
         return len(self._items)
 
+    @property
+    def byte_count(self):
+        return sum(value.numel() * value.element_size()
+                   for (item, signature) in self._items
+                   for value in (*item, signature) if torch.is_tensor(value))
+
     def add_batch(self, inputs, targets, logits=None):
         inputs = inputs.detach().cpu()
         targets = targets.detach().cpu()

@@ -57,12 +57,16 @@ def main():
                                     'variance_weight': 0.5,
                                     'min_similarity': 0.1})
     for result in trainer.fit(round_batches):
-        print('round={} clusters={} losses={} drifted={} memory={} '
-              'distribution_entries={} distribution_bytes={} loss_components={}'.format(
+        print('round={} clusters={} losses={} seasonal_drift={} trend_drift={} '
+              'reclustered={} retrievals={} memory={} distribution_entries={} '
+              'distribution_bytes={} memory_bytes={} loss_components={}'.format(
             result['round'], result['clusters'],
-            [round(loss, 5) for loss in result['losses']], result['drifted'],
+            [round(loss, 5) for loss in result['losses']],
+            result['seasonal_drift'], result['trend_drift'],
+            result['reclustered'], result['retrievals'],
             result['memory'], result['distribution_entries'],
-            result['distribution_bytes'], result['loss_components']))
+            result['distribution_bytes'], result['memory_bytes'],
+            result['loss_components']))
 
 
 if __name__ == '__main__':

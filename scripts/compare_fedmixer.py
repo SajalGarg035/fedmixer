@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -53,7 +54,8 @@ def build_rounds(data_dir, client_count, rounds, limit):
     return train_batches, test_batches
 
 
-def run_variant(round_batches, test_rounds, device, continual, seed):
+def run_variant(round_batches, test_rounds, device, continual, seed,
+                method='legacy', strategy='fedmixer', mutual_enabled=True):
     torch.manual_seed(seed)
     clients = []
     for _ in round_batches[0]:
@@ -66,8 +68,14 @@ def run_variant(round_batches, test_rounds, device, continual, seed):
     def forward(model, inputs):
         return model(inputs, None, None, None)
 
-    trainer = ContinualFedMixer(clients, forward)
+    trainer = ContinualFedMixer(
+        clients, forward, method=method, strategy=strategy,
+        mutual_enabled=mutual_enabled)
     history = []
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    started = time.perf_counter()
     error_matrix = [[{} for _ in test_rounds] for _ in clients]
     for round_index in range(len(round_batches)):
         history.extend(trainer.fit(
@@ -105,7 +113,13 @@ def run_variant(round_batches, test_rounds, device, continual, seed):
     round_mse = [sum(error_matrix[client][index][index][0]
                      for client in range(len(clients))) / len(clients)
                  for index in range(len(test_rounds))]
-    return history, ace_mse, ace_mae, bwt_mse, bwt_mae, round_mse
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+    runtime_seconds = time.perf_counter() - started
+    peak_cuda_bytes = (torch.cuda.max_memory_allocated(device)
+                       if device.type == 'cuda' else None)
+    return (history, ace_mse, ace_mae, bwt_mse, bwt_mae, round_mse,
+            runtime_seconds, peak_cuda_bytes)
 
 
 def main():
@@ -116,7 +130,7 @@ def main():
     parser.add_argument('--limit', type=int, default=0,
                         help='rows per client; use 0 for the full prepared dataset')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--mode', choices=['baseline', 'continual', 'both'], default='both')
+    parser.add_argument('--mode', choices=['baseline', 'continual', 'both', 'all'], default='all')
     parser.add_argument('--output', default='./output/output.log')
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -126,22 +140,33 @@ def main():
     round_batches, test_rounds = build_rounds(args.data_dir, args.clients, args.rounds, args.limit)
 
     variants = {
-        'baseline': [('FedMixer baseline', False)],
-        'continual': [('Continual FedMixer', True)],
-        'both': [('FedMixer baseline', False), ('Continual FedMixer', True)],
+        'baseline': [('FedAvg', False, 'legacy', 'fedavg', False)],
+        'continual': [('FedMixer-FCL', True, 'legacy', 'fedmixer', True)],
+        'both': [('FedMixer baseline', False, 'legacy', 'fedmixer', True),
+                 ('FedMixer-FCL', True, 'legacy', 'fedmixer', True)],
+        'all': [
+            ('FedAvg', False, 'legacy', 'fedavg', False),
+            ('FedAvg-FCL', True, 'legacy', 'fedavg', False),
+            ('FedMixer-FCL', True, 'legacy', 'fedmixer', True),
+            ('FedMixer-DistributionMemory (Proposed)', True,
+             'proposed', 'fedmixer', True),
+        ],
     }
     output_lines = []
-    for name, continual in variants[args.mode]:
+    for name, continual, method, strategy, mutual_enabled in variants[args.mode]:
         (history, ace_mse, ace_mae, bwt_mse,
-         bwt_mae, round_mse) = run_variant(
-            round_batches, test_rounds, device, continual, seed=2021)
+         bwt_mae, round_mse, runtime_seconds, peak_cuda_bytes) = run_variant(
+            round_batches, test_rounds, device, continual, seed=2021,
+            method=method, strategy=strategy, mutual_enabled=mutual_enabled)
         output_lines.append(
             '{}: ACE_MSE={:.6f} ACE_MAE={:.6f} BWT_MSE={:.6f} BWT_MAE={:.6f} '
-            'round_MSE={} seasonal_clusters={} trend_clusters={} memory={}'.format(
+            'round_MSE={} seasonal_clusters={} trend_clusters={} memory={} '
+            'memory_bytes={} runtime_seconds={:.3f} peak_cuda_bytes={}'.format(
                 name, ace_mse, ace_mae, bwt_mse, bwt_mae,
                 [round(value, 6) for value in round_mse],
                 history[-1]['seasonal_clusters'], history[-1]['trend_clusters'],
-                history[-1]['memory']))
+                history[-1]['memory'], history[-1]['memory_bytes'],
+                runtime_seconds, peak_cuda_bytes))
 
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
     with open(args.output, 'a', encoding='utf-8') as handle:

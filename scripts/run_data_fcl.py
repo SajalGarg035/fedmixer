@@ -32,10 +32,11 @@ def load_public_anchor(path):
     if path is None:
         return None
     with __import__('numpy').load(path, allow_pickle=False) as data:
-        key = 'anchor_x' if 'anchor_x' in data else 'train_x'
-        if key not in data:
-            raise ValueError('public anchor NPZ must contain anchor_x or train_x')
-        return torch.from_numpy(data[key].astype('float32', copy=True))
+        if 'anchor_x' not in data:
+            raise ValueError(
+                'public anchor NPZ must contain independently sourced anchor_x; '
+                'train_x is not accepted as a public anchor')
+        return torch.from_numpy(data['anchor_x'].astype('float32', copy=True))
 
 
 def evaluate(model, test_rounds, seen_rounds, client_index, forward):
@@ -105,10 +106,15 @@ def main():
         history_weight=config['distillation'].get('history_weight', 0.3),
         representation_weight=config['distillation'].get(
             'representation_weight', 0.1),
+        history_enabled=config['distillation'].get('history', True),
+        representation_enabled=config['distillation'].get('representation', True),
+        mutual_enabled=config['distillation'].get('mutual', True),
+        strategy=config.get('strategy', 'fedmixer'),
         distribution_memory_kwargs=memory_config)
     results = []
     for round_index, round_batches in enumerate(train_rounds):
         history = trainer.fit([round_batches], start_round=round_index + 1)
+        round_log = history[0]
         metrics = []
         for client_index, client in enumerate(clients):
             metrics.append(evaluate(
@@ -122,10 +128,14 @@ def main():
                 memory.byte_count for memory in trainer.distribution_memories],
         }
         results.append(result)
-        print('round={} season_start={} active={} metrics={} distribution_bytes={}'.format(
+        print('round={} season_start={} active={} metrics={} seasonal_drift={} '
+              'trend_drift={} reclustered={} retrievals={} loss_components={} '
+              'memory_bytes={}'.format(
             round_index + 1, metadata[round_index]['season_start'],
             metadata[round_index]['active_clients'], metrics,
-            [memory.byte_count for memory in trainer.distribution_memories]))
+            round_log['seasonal_drift'], round_log['trend_drift'],
+            round_log['reclustered'], round_log['retrievals'],
+            round_log['loss_components'], round_log['memory_bytes']))
 
     Path(args.metrics_output).parent.mkdir(parents=True, exist_ok=True)
     with Path(args.metrics_output).open('w', encoding='utf-8') as handle:
@@ -140,6 +150,7 @@ def main():
     if args.checkpoint:
         Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
         checkpoint = {
+            'schema_version': 1,
             'station_ids': station_ids,
             'metadata': metadata,
             'trainer': trainer.state_dict(),

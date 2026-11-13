@@ -8,7 +8,9 @@ import torch
 from torch import nn
 
 from continual_federated import (ContinualClient, ContinualFedMixer,
-                                 DistributionMemory, load_season_rounds)
+                                 DistributionMemory, load_season_rounds,
+                                 MultiscaleSpectralTrendDetector)
+from models.TimeMixer import Model
 
 
 class RepresentedLinear(nn.Module):
@@ -25,6 +27,16 @@ class RepresentedLinear(nn.Module):
     def forward_with_representation(self, inputs):
         prediction = self.forward(inputs)
         return prediction, self.encode(inputs)
+
+
+class RecordingLinear(RepresentedLinear):
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def forward(self, inputs):
+        self.seen.append(inputs.detach().clone())
+        return super().forward(inputs)
 
 
 class ReplayFreeDistributionTests(unittest.TestCase):
@@ -134,6 +146,221 @@ class ReplayFreeDistributionTests(unittest.TestCase):
         self.assertEqual(history[0]['clusters'], [[0]])
         self.assertEqual(len(trainer.distribution_memories[0]), 1)
         self.assertEqual(len(trainer.distribution_memories[1]), 0)
+
+    def test_reference_encoder_uses_first_active_aggregated_client(self):
+        torch.manual_seed(19)
+        clients = []
+        for _ in range(2):
+            model = RepresentedLinear()
+            clients.append(ContinualClient(
+                model, torch.optim.SGD(model.parameters(), lr=0.1),
+                torch.device('cpu'), replay_enabled=False))
+        initial_inactive = [p.detach().clone() for p in clients[0].model.parameters()]
+        data = torch.arange(1, 5, dtype=torch.float32).reshape(4, 1, 1)
+        trainer = ContinualFedMixer(
+            clients, lambda model, x: model(x), method='proposed',
+            generate_public_anchors=False)
+        trainer.fit([[None, [(data, torch.zeros_like(data))]]])
+        for old, new in zip(initial_inactive, clients[0].model.parameters()):
+            self.assertTrue(torch.equal(old, new.detach()))
+        for reference, active in zip(trainer.reference_encoder.parameters(),
+                                     clients[1].model.parameters()):
+            self.assertTrue(torch.equal(reference.detach(), active.detach()))
+
+    def test_post_mixing_representation_retains_time_and_hidden_features(self):
+        config = type('Config', (), dict(
+            task_name='long_term_forecast', seq_len=8, label_len=2, pred_len=2,
+            down_sampling_window=2, down_sampling_layers=1,
+            channel_independence=1, e_layers=1, moving_avg=3, enc_in=1,
+            c_out=1, use_future_temporal_feature=0, d_model=8, embed='timeF',
+            freq='h', dropout=0.0, use_norm=1, decomp_method='moving_avg',
+            d_ff=16, top_k=3, factor=1, activation='gelu',
+            down_sampling_method='avg'))()
+        model = Model(config).eval()
+        inputs = torch.randn(3, 8, 1)
+        with torch.no_grad():
+            prediction, representation = model.forward_with_representation(inputs)
+        self.assertEqual(prediction.shape, (3, 2, 1))
+        self.assertEqual(representation.shape[0], 3)
+        self.assertGreater(representation.shape[1], 2)
+        self.assertTrue(torch.isfinite(representation).all())
+
+    def test_similarity_weighted_topk_retention_and_eviction(self):
+        memory = DistributionMemory(max_entries=2, min_similarity=0.1)
+        for task, shift in enumerate((0.0, 0.5, 2.0), start=1):
+            summary = memory.summarize(torch.tensor([[shift, 0.0],
+                                                     [shift + 0.1, 0.2]]))
+            memory.add(task, summary)
+        self.assertEqual(len(memory), 2)
+        self.assertNotIn(1, [entry['task_id'] for entry in memory.entries])
+        query = memory.entries[0]
+        retrieved = memory.retrieve(query, top_k=2)
+        weighted = sum(item['similarity'] * item['weight'] for item in retrieved)
+        expected = 0.1 + 0.9 * weighted
+        self.assertAlmostEqual(memory.retention_weight(retrieved), expected, places=6)
+        self.assertAlmostEqual(sum(item['weight'] for item in retrieved), 1.0)
+
+    def test_round_drift_aggregates_batches_and_separates_pathways(self):
+        detector = MultiscaleSpectralTrendDetector(
+            seasonal_threshold=0.05, trend_threshold=2.1,
+            scales=1, minimum_length=4)
+        stable_trend_a = torch.linspace(0, 1, 32).view(1, 32, 1)
+        detector.update(stable_trend_a)
+        season = torch.sin(torch.arange(32) * 2 * torch.pi / 8).view(1, 32, 1)
+        seasonal, trend = detector.signatures(season)
+        flags = detector.update_signatures(seasonal, trend)[:2]
+        self.assertTrue(flags[0])
+        self.assertFalse(flags[1])
+
+        detector = MultiscaleSpectralTrendDetector(
+            seasonal_threshold=2.1, trend_threshold=0.05,
+            scales=1, minimum_length=4)
+        detector.update(stable_trend_a)
+        new_trend = -stable_trend_a
+        seasonal, trend = detector.signatures(new_trend)
+        flags = detector.update_signatures(seasonal, trend)[:2]
+        self.assertFalse(flags[0])
+        self.assertTrue(flags[1])
+
+    def test_reclustering_only_when_pathway_drift_or_initialization(self):
+        clients = []
+        for _ in range(2):
+            model = RepresentedLinear()
+            clients.append(ContinualClient(
+                model, torch.optim.SGD(model.parameters(), lr=0.01),
+                torch.device('cpu'), replay_enabled=False))
+        inputs = torch.ones(4, 1, 1)
+        trainer = ContinualFedMixer(
+            clients, lambda model, x: model(x), method='proposed',
+            generate_public_anchors=False)
+        first = trainer.fit([[[ (inputs, inputs)], [(inputs, inputs)]]])[0]
+        second = trainer.fit([[[ (inputs, inputs)], [(inputs, inputs)]]])[0]
+        self.assertEqual(first['reclustered'], {'seasonal': True, 'trend': True})
+        self.assertEqual(second['reclustered'], {'seasonal': False, 'trend': False})
+
+    def test_reclustering_is_pathway_specific(self):
+        ramp = torch.linspace(0, 1, 32).view(1, 32, 1).repeat(4, 1, 1)
+        seasonal = torch.sin(torch.arange(32) * 2 * torch.pi / 8)
+        seasonal = seasonal.view(1, 32, 1).repeat(4, 1, 1)
+        reverse = -ramp
+        targets = torch.zeros(4, 32, 1)
+
+        def make_trainer(seasonal_threshold, trend_threshold):
+            model = RepresentedLinear()
+            client = ContinualClient(
+                model, torch.optim.SGD(model.parameters(), lr=0.0),
+                torch.device('cpu'), replay_enabled=False,
+                drift_threshold=seasonal_threshold,
+                trend_threshold=trend_threshold)
+            return ContinualFedMixer(
+                [client], lambda current, x: current(x), method='proposed',
+                generate_public_anchors=False)
+
+        seasonal_trainer = make_trainer(0.05, 2.1)
+        seasonal_trainer.fit([[[ (ramp, targets)]]])
+        seasonal_result = seasonal_trainer.fit([[[ (seasonal, targets)]]])[0]
+        self.assertEqual(seasonal_result['reclustered'],
+                         {'seasonal': True, 'trend': False})
+
+        trend_trainer = make_trainer(2.1, 0.05)
+        trend_trainer.fit([[[ (ramp, targets)]]])
+        trend_result = trend_trainer.fit([[[ (reverse, targets)]]])[0]
+        self.assertEqual(trend_result['reclustered'],
+                         {'seasonal': False, 'trend': True})
+
+    def test_loss_switches_independently_disable_terms(self):
+        inputs = torch.ones(3, 1, 1)
+        targets = torch.zeros_like(inputs)
+        for enabled in ('history', 'representation', 'mutual'):
+            model = RepresentedLinear()
+            client = ContinualClient(
+                model, torch.optim.SGD(model.parameters(), lr=0.0),
+                torch.device('cpu'), replay_enabled=False)
+            client.set_previous_teacher()
+            with torch.no_grad():
+                for parameter in client.model.parameters():
+                    parameter.add_(1.0)
+            args = {'history_enabled': True, 'representation_enabled': True,
+                    'mutual_enabled': True}
+            args[enabled + '_enabled'] = False
+            result = client.train_batch_replay_free(
+                inputs, targets, lambda m, x: m(x), retention_weight=1.0,
+                distillation_inputs=inputs,
+                distillation_targets=torch.zeros_like(inputs), **args)
+            key = {'history': 'history', 'representation': 'representation',
+                   'mutual': 'mutual'}[enabled]
+            self.assertEqual(result[key], 0.0)
+            self.assertGreater(result['total'], result['forecast'])
+
+    def test_checkpoint_save_restore_and_schema_validation(self):
+        clients = []
+        for _ in range(2):
+            model = RepresentedLinear()
+            clients.append(ContinualClient(
+                model, torch.optim.SGD(model.parameters(), lr=0.01),
+                torch.device('cpu'), replay_enabled=False))
+        inputs = torch.arange(4, dtype=torch.float32).reshape(4, 1, 1)
+        trainer = ContinualFedMixer(
+            clients, lambda model, x: model(x), method='proposed',
+            generate_public_anchors=False)
+        trainer.fit([[[ (inputs, inputs)], [(inputs, inputs)]]])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'trainer.pt'
+            torch.save(trainer.state_dict(), path)
+            state = torch.load(path, map_location='cpu', weights_only=False)
+            restored_clients = []
+            for _ in range(2):
+                model = RepresentedLinear()
+                restored_clients.append(ContinualClient(
+                    model, torch.optim.SGD(model.parameters(), lr=0.01),
+                    torch.device('cpu'), replay_enabled=False))
+            restored = ContinualFedMixer(
+                restored_clients, lambda model, x: model(x), method='proposed',
+                generate_public_anchors=False)
+            restored.load_state_dict(state)
+            self.assertEqual([len(m) for m in restored.distribution_memories],
+                             [len(m) for m in trainer.distribution_memories])
+            for left, right in zip(trainer.reference_encoder.parameters(),
+                                   restored.reference_encoder.parameters()):
+                self.assertTrue(torch.equal(left, right))
+            for key in ('schema_version', 'method', 'distribution_memories'):
+                state.pop(key, None)
+            with self.assertRaises(ValueError):
+                restored.load_state_dict({'schema_version': 99, 'method': 'proposed'})
+
+    def test_teacher_and_student_use_identical_distillation_input(self):
+        model = RecordingLinear()
+        client = ContinualClient(
+            model, torch.optim.SGD(model.parameters(), lr=0.0),
+            torch.device('cpu'), replay_enabled=False)
+        client.set_previous_teacher()
+        inputs = torch.tensor([[[2.0]], [[3.0]]])
+        client.train_batch_replay_free(
+            inputs, torch.zeros_like(inputs), lambda current, x: current(x),
+            retention_weight=1.0)
+        student_input = client.model.seen[-1]
+        teacher_input = client.previous_teacher.seen[-1]
+        self.assertTrue(torch.equal(student_input, teacher_input))
+        self.assertTrue(torch.equal(student_input, inputs))
+
+    def test_proposed_memory_accounting_includes_reference_and_teachers(self):
+        clients = []
+        for _ in range(2):
+            model = RepresentedLinear()
+            clients.append(ContinualClient(
+                model, torch.optim.SGD(model.parameters(), lr=0.01),
+                torch.device('cpu'), replay_enabled=False))
+        inputs = torch.ones(4, 1, 1)
+        trainer = ContinualFedMixer(
+            clients, lambda model, x: model(x), method='proposed',
+            generate_public_anchors=False)
+        result = trainer.fit([[[ (inputs, inputs)], [(inputs, inputs)]]])[0]
+        self.assertGreater(result['memory_bytes']['reference_encoder_bytes'], 0)
+        self.assertGreater(result['memory_bytes']['teacher_bytes'], 0)
+        self.assertEqual(result['memory_bytes']['total_bytes'],
+                         result['memory_bytes']['distribution_bytes'] +
+                         result['memory_bytes']['reference_encoder_bytes'] +
+                         result['memory_bytes']['teacher_bytes'])
 
 
 if __name__ == '__main__':
